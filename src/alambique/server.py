@@ -89,7 +89,10 @@ TOOL_DEFINITIONS = [
 
     Tool(
         name="session_end",
-        description="Finaliza la sesión y dispara la consolidación.",
+        description=(
+            "Finaliza la sesión, sincroniza el transcript externo si hay binding guardado "
+            "y encola consolidación. Devuelve queued y pending_consolidation."
+        ),
         inputSchema={
             "type": "object",
             "properties": {

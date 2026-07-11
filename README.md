@@ -2,54 +2,46 @@
 
 Memoria semántica y episódica para el asistente virtual **Lucy** (v0.2.0 — integración Grok CLI). Destila conversaciones en hechos atómicos y mantiene la continuidad de su personalidad usando LLMs y búsqueda vectorial local.
 
-## 📌 Arquitectura Simplificada
+## Arquitectura
 
-* **Base de Datos**: SQLite en modo WAL con la extensión `sqlite-vec` para búsqueda semántica local.
-* **Embeddings**: Generados localmente con `ollama` y el modelo `bge-m3` (1024 dimensiones).
-* **Razonamiento (LLM)**: API de OpenCode Go con el modelo `qwen3.7-plus`.
-* **Ámbito**: Exclusivo para Lucy. No hay namespaces compartidos ni crosstalk con otros agentes; toda la base de datos pertenece a la relación entre Víctor y Lucy.
+| Capa | Tecnología | Rol |
+|---|---|---|
+| Persistencia | SQLite WAL + `sqlite-vec` | Sesiones, mensajes, hechos, embeddings |
+| Embeddings | Ollama `bge-m3` (1024d) | Búsqueda semántica local |
+| Razonamiento | OpenCode Go `qwen3.7-plus` | Consolidación y recall narrativo |
+| Transcripts | `GrokCliProvider`, `AntigravityCliProvider` | Importación batch al cerrar sesión |
+| Daemon | MCP SSE en `:9042` | 12 herramientas + watchdog + consolidación async |
+
+Ámbito exclusivo Lucy — sin namespaces ni multi-agente.
 
 ---
 
-## 🛠️ Requisitos
+## Requisitos
 
 * Python ≥ 3.11
-* Ollama corriendo en `localhost:11434` con el modelo `bge-m3`.
-* API Key de OpenCode Go configurada en el sistema (leída automáticamente vía `pass show apikeys/alambique`).
+* Ollama en `localhost:11434` con modelo `bge-m3`
+* API Key OpenCode Go (`pass show apikeys/alambique`)
 
 ```bash
-# Instalación de dependencias
 pip install -e .
 ```
 
 ---
 
-## 🚀 Uso como Servidor MCP
+## Servidor MCP
 
 ### Daemon SSE (producción)
-
-Alambique corre como servicio systemd y expone MCP en `http://localhost:9042/sse`:
 
 ```bash
 systemctl --user start alambique.service
 systemctl --user status alambique.service
 ```
 
-Grok CLI y otros clientes se conectan a esa URL. Tras reiniciar el servicio, abre una conversación nueva en Grok (el MCP de la sesión activa queda roto).
+URL: `http://localhost:9042/sse`
 
-### Grok CLI
-
-Grok persiste el diálogo en `~/.grok/sessions/<cwd-encoded>/<conversation-id>/chat_history.jsonl`. Alambique lo lee al cerrar la sesión — no hay `message_append`.
-
-1. **`session_start`** con `client="grok"` y `workspace=<ruta absoluta del cwd>`. Opcionalmente `conversation_id` si el servidor no puede auto-detectarlo vía `active_sessions.json`.
-2. Conversación normal — Grok escribe el transcript en disco.
-3. **`session_end`** con el `session_id` de Alambique: sincroniza mensajes, cierra y dispara consolidación.
-
-El binding (`client` + `conversation_id`) se guarda al abrir. Si la sesión queda abierta, el watchdog (30 min) sincroniza y trunca antes de consolidar. Al apagar el daemon, las sesiones abiertas se cierran igual.
+Tras reiniciar el servicio o desplegar código nuevo, **recarga Grok** — el MCP de la sesión activa queda roto.
 
 ### Stdio (desarrollo)
-
-Para clientes que arrancan el servidor como subproceso:
 
 ```json
 "mcp": {
@@ -63,11 +55,69 @@ Para clientes que arrancan el servidor como subproceso:
 
 ---
 
-## 🧪 Pruebas Unitarias
+## Flujo Grok CLI
 
-El proyecto cuenta con una batería de **267 pruebas unitarias** que cubren el ciclo de vida completo de la base de datos, el cliente Ollama, la consolidación por LLM, el proveedor de transcripts Grok CLI y las herramientas MCP.
+Grok persiste el diálogo en `~/.grok/sessions/<cwd-encoded>/<conversation-id>/chat_history.jsonl`. **No existe `message_append`.**
+
+```mermaid
+flowchart LR
+    A[session_start] -->|binding client+workspace| B[(sessions)]
+    C[Grok escribe chat_history.jsonl] --> D[session_end / watchdog]
+    D -->|GrokCliProvider| E[(messages)]
+    E --> F[Consolidación LLM]
+    F --> G[(facts + summary)]
+```
+
+1. **`session_start`** — `client="grok"`, `workspace=<cwd absoluto>`. Resuelve `conversation_id` vía `active_sessions.json` (normaliza rutas, desambigua pestañas por `opened_at`). Puede enlazar antes de que exista el fichero de transcript (`grok_transcript_pending`).
+2. **Conversación** — Grok escribe el transcript en disco.
+3. **`session_end`** — solo `session_id` de Alambique. Sincroniza mensajes user/assistant (sin tool_results), cierra y encola consolidación.
+
+**Binding fallido** (`status: "error"`, `session_id: null`): no se crea sesión huérfana. Revisa `warnings` y reintenta.
+
+**Reuso** — misma conversación Grok → reutiliza sesión open (`session_reused`).
+
+**Red de seguridad** — watchdog (30 min inactividad) y shutdown del daemon sincronizan y cierran sesiones abiertas con binding.
+
+### Respuestas clave
+
+| Tool | Campos útiles |
+|---|---|
+| `session_start` | `session_id`, `persona`, `client`, `conversation_id`, `session_reused`, `warnings`, `degraded` |
+| `session_end` | `queued`, `pending_consolidation` |
+
+---
+
+## Herramientas MCP (12)
+
+| Tool | Uso |
+|---|---|
+| `session_start` | Abre sesión, binding transcript, persona |
+| `session_end` | Sync transcript, cierra, encola consolidación |
+| `memory_recall` | Búsqueda semántica + resumen LLM |
+| `memory_search` | FTS5 en mensajes |
+| `memory_context` | Mensajes literales paginados (+ `client`/`conversation_id`) |
+| `memory_status` | Estadísticas |
+| `memory_health` | Diagnóstico (Ollama, API, cola, embeddings) |
+| `memory_reembed` | Repara embeddings huérfanos |
+| `memory_deduplicate` | Fusiona hechos duplicados (`dry_run` por defecto) |
+| `session_list` | Sesiones recientes (+ binding) |
+| `memory_forget` | Soft-delete de hecho |
+| `memory_export` | Export JSON facts + sesiones |
+
+---
+
+## Operativa
+
+* DB: `~/.local/share/alambique/alambique.db`
+* No editar la DB con el daemon en marcha — parar el servicio antes.
+* Consolidación corre en background; `memory_health` muestra la cola pendiente.
+
+---
+
+## Pruebas
+
+**267** pruebas unitarias (DB, Ollama, consolidación, Grok CLI, herramientas MCP).
 
 ```bash
-# Ejecutar la suite completa
 .venv/bin/pytest -v
 ```
