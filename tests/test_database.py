@@ -116,6 +116,20 @@ class TestSessions:
         pending = db.get_pending_consolidations()
         assert len(pending) == 0
 
+    def test_find_stale_sessions_uses_sqlite_clock(self, db):
+        fresh = db.create_session()
+        stale = db.create_session()
+        db.conn.execute(
+            "UPDATE sessions SET created_at = datetime('now', '-45 minutes') WHERE id = ?",
+            (stale.id,),
+        )
+        db.conn.commit()
+
+        found = db.find_stale_sessions(timeout_minutes=30)
+        ids = {s.id for s in found}
+        assert stale.id in ids
+        assert fresh.id not in ids
+
 
 class TestMessages:
     def test_append_message(self, db):

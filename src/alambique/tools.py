@@ -745,7 +745,15 @@ class ToolHandler:
     ) -> SessionEndOutput:
         status = SessionStatus.TRUNCATED if truncated else SessionStatus.CLOSED
         await self._close_session(session_id, status, conversation_id, client)
-        return SessionEndOutput()
+        async with self._db_guard():
+            session = self.db.get_session(session_id)
+            pending = self.db.count_pending_consolidations_db()
+            queued = (
+                session is not None
+                and session.status in (SessionStatus.CLOSED, SessionStatus.TRUNCATED)
+                and not session.consolidated
+            )
+        return SessionEndOutput(queued=queued, pending_consolidation=pending)
 
     # ── tool: memory_recall ─────────────────────────────────────
 

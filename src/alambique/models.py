@@ -162,7 +162,8 @@ class SessionStartOutput(BaseModel):
 
 
 class SessionEndOutput(BaseModel):
-    queued: bool = True
+    queued: bool = False
+    pending_consolidation: int = 0
 
 
 class MemoryRecallOutput(BaseModel):

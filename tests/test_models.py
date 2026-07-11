@@ -111,8 +111,9 @@ class TestMCPOutputModels:
         assert o.persona is None
 
     def test_session_end(self):
-        o = SessionEndOutput()
+        o = SessionEndOutput(queued=True, pending_consolidation=2)
         assert o.queued is True
+        assert o.pending_consolidation == 2
 
     def test_memory_recall_empty(self):
         o = MemoryRecallOutput(summary="No hay información")

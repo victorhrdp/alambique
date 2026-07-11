@@ -414,9 +414,11 @@ class TestSessionEnd:
 
     def test_closed_session_pending_consolidation(self, tools):
         r = asyncio.run(tools.session_start())
-        asyncio.run(tools.session_end(r.session_id))
+        out = asyncio.run(tools.session_end(r.session_id))
         pending = tools.db.get_pending_consolidations()
         assert len(pending) == 1
+        assert out.queued is True
+        assert out.pending_consolidation == 1
 
     def test_session_end_with_transcript_sync(self, tools, monkeypatch):
         from pathlib import Path

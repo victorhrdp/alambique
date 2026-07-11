@@ -1,6 +1,6 @@
 # Alambique — Memoria para Lucy
 
-Memoria semántica y episódica para el asistente virtual **Lucy**. Destila conversaciones en hechos atómicos y mantiene la continuidad de su personalidad usando LLMs y búsqueda vectorial local.
+Memoria semántica y episódica para el asistente virtual **Lucy** (v0.2.0 — integración Grok CLI). Destila conversaciones en hechos atómicos y mantiene la continuidad de su personalidad usando LLMs y búsqueda vectorial local.
 
 ## 📌 Arquitectura Simplificada
 
@@ -65,7 +65,7 @@ Para clientes que arrancan el servidor como subproceso:
 
 ## 🧪 Pruebas Unitarias
 
-El proyecto cuenta con una batería de **266 pruebas unitarias** que cubren el ciclo de vida completo de la base de datos, el cliente Ollama, la consolidación por LLM, el proveedor de transcripts Grok CLI y las herramientas MCP.
+El proyecto cuenta con una batería de **267 pruebas unitarias** que cubren el ciclo de vida completo de la base de datos, el cliente Ollama, la consolidación por LLM, el proveedor de transcripts Grok CLI y las herramientas MCP.
 
 ```bash
 # Ejecutar la suite completa

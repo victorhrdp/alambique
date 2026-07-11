@@ -274,7 +274,11 @@ async def run(transport: str = "stdio", port: int = DEFAULT_SSE_PORT) -> None:
     # Shutdown handler
     def shutdown(signum=None, frame=None):
         logger.info("Señal recibida, cerrando...")
-        asyncio.create_task(_shutdown(ollama, handler_tools, db))
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_shutdown(ollama, handler_tools, db))
+        except RuntimeError:
+            logger.warning("Sin event loop activo; shutdown diferido al cierre del proceso")
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
@@ -333,7 +337,7 @@ async def run(transport: str = "stdio", port: int = DEFAULT_SSE_PORT) -> None:
         app = CORSMiddleware(
             router,
             allow_origins=["*"],
-            allow_credentials=True,
+            allow_credentials=False,
             allow_methods=["*"],
             allow_headers=["*"],
         )

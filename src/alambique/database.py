@@ -419,16 +419,17 @@ class Database:
         return [Session(**dict(r)) for r in rows]
 
     def find_stale_sessions(self, timeout_minutes: int = 30) -> list[Session]:
-        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=timeout_minutes)).strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
+        if timeout_minutes >= 0:
+            modifier = f"-{timeout_minutes} minutes"
+        else:
+            modifier = f"{-timeout_minutes} minutes"
         rows = self.conn.execute(
             "SELECT s.* FROM sessions s WHERE s.status = 'open' "
-            "AND COALESCE("
+            "AND datetime(COALESCE("
             "    (SELECT MAX(timestamp) FROM messages WHERE session_id = s.id),"
             "    s.created_at"
-            ") < ?",
-            (cutoff,),
+            ")) < datetime('now', ?)",
+            (modifier,),
         ).fetchall()
         return [Session(**dict(r)) for r in rows]
 
