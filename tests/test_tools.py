@@ -212,6 +212,34 @@ class TestSessionStartBinding:
         assert "binding_missing_client" in result.warnings
         assert result.degraded is True
         assert result.conversation_id is None
+        assert result.session_id is not None
+
+    def test_session_start_grok_binding_failed_no_orphan(self, tools, mock_ollama):
+        from pathlib import Path
+
+        tools._compose_session_persona = AsyncMock(return_value=("persona", []))
+        active_path = Path.home() / ".grok" / "active_sessions.json"
+        backup = active_path.read_text(encoding="utf-8") if active_path.exists() else None
+        active_path.parent.mkdir(parents=True, exist_ok=True)
+        active_path.write_text("[]", encoding="utf-8")
+
+        try:
+            before = len(tools.db.get_all_sessions())
+            result = asyncio.run(
+                tools.session_start(
+                    client="grok",
+                    workspace="/tmp/alambique-grok-missing-binding",
+                )
+            )
+            assert result.status == "error"
+            assert result.session_id is None
+            assert "binding_failed" in result.warnings
+            assert len(tools.db.get_all_sessions()) == before
+        finally:
+            if backup is None:
+                active_path.unlink(missing_ok=True)
+            else:
+                active_path.write_text(backup, encoding="utf-8")
 
     def test_session_start_reuses_existing_binding(self, tools, monkeypatch):
         from pathlib import Path
@@ -1413,6 +1441,101 @@ class TestBackgroundTasks:
 
         msgs = tools.db.get_session_messages(started.session_id)
         assert msgs == []
+
+    def test_shutdown_open_sessions_syncs_and_closes(self, tools, monkeypatch):
+        from pathlib import Path
+        import shutil
+        import json
+        from urllib.parse import quote
+
+        test_conv_id = "test-grok-shutdown-001"
+        workspace = "/tmp/alambique-grok-shutdown"
+        encoded_cwd = quote(workspace, safe="")
+        session_dir = Path.home() / ".grok" / "sessions" / encoded_cwd / test_conv_id
+        transcript_file = session_dir / "chat_history.jsonl"
+
+        lines = [
+            {
+                "type": "user",
+                "content": [{"type": "text", "text": "<user_query>\nShutdown sync\n</user_query>"}],
+            },
+            {"type": "assistant", "content": "Cerrando limpio"},
+        ]
+        session_dir.mkdir(parents=True, exist_ok=True)
+        with open(transcript_file, "w", encoding="utf-8") as f:
+            for line in lines:
+                f.write(json.dumps(line) + "\n")
+
+        active_path = Path.home() / ".grok" / "active_sessions.json"
+        backup = active_path.read_text(encoding="utf-8") if active_path.exists() else None
+        active_path.parent.mkdir(parents=True, exist_ok=True)
+        active_path.write_text(
+            json.dumps(
+                [{"session_id": test_conv_id, "pid": 1, "cwd": workspace, "opened_at": "now"}]
+            ),
+            encoding="utf-8",
+        )
+
+        try:
+            started = asyncio.run(
+                tools.session_start(client="grok", workspace=workspace)
+            )
+            asyncio.run(tools.shutdown_open_sessions())
+
+            closed = tools.db.get_session(started.session_id)
+            msgs = tools.db.get_session_messages(started.session_id)
+            assert closed.status == SessionStatus.TRUNCATED
+            assert len(msgs) == 2
+            assert msgs[0].content == "Shutdown sync"
+            assert msgs[1].content == "Cerrando limpio"
+        finally:
+            if backup is None:
+                active_path.unlink(missing_ok=True)
+            else:
+                active_path.write_text(backup, encoding="utf-8")
+            group_dir = session_dir.parent
+            if group_dir.exists():
+                shutil.rmtree(group_dir)
+
+    def test_consolidation_resyncs_empty_bound_session(self, tools, monkeypatch):
+        from pathlib import Path
+        import shutil
+        import json
+        from urllib.parse import quote
+
+        test_conv_id = "test-grok-consolidate-resync-001"
+        workspace = "/tmp/alambique-grok-consolidate-resync"
+        encoded_cwd = quote(workspace, safe="")
+        session_dir = Path.home() / ".grok" / "sessions" / encoded_cwd / test_conv_id
+        transcript_file = session_dir / "chat_history.jsonl"
+
+        lines = [
+            {
+                "type": "user",
+                "content": [{"type": "text", "text": "<user_query>\nRe-sync\n</user_query>"}],
+            },
+            {"type": "assistant", "content": "Importado tarde"},
+        ]
+        session_dir.mkdir(parents=True, exist_ok=True)
+        with open(transcript_file, "w", encoding="utf-8") as f:
+            for line in lines:
+                f.write(json.dumps(line) + "\n")
+
+        session = tools.db.create_session(client="grok", conversation_id=test_conv_id)
+        tools.db.close_session(session.id, SessionStatus.CLOSED)
+
+        try:
+            bound = tools.db.get_session(session.id)
+            asyncio.run(tools._consolidate_session(bound))
+
+            msgs = tools.db.get_session_messages(session.id)
+            assert len(msgs) == 2
+            assert msgs[0].content == "Re-sync"
+            assert msgs[1].content == "Importado tarde"
+        finally:
+            group_dir = session_dir.parent
+            if group_dir.exists():
+                shutil.rmtree(group_dir)
 
     def test_online_property_false_without_key(self, tools):
         assert tools.online is False

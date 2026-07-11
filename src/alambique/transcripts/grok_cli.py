@@ -10,8 +10,56 @@ logger = logging.getLogger("alambique.transcripts.grok_cli")
 GROK_HOME = Path(os.environ.get("GROK_HOME", Path.home() / ".grok"))
 
 
+def normalize_workspace(workspace: str | None) -> str | None:
+    """Resolve symlinks and strip trailing slashes for stable cwd matching."""
+    if not workspace:
+        return None
+    workspace = workspace.strip()
+    if not workspace:
+        return None
+    try:
+        return str(Path(workspace).expanduser().resolve())
+    except OSError:
+        return workspace.rstrip("/\\") or workspace
+
+
 def _resolve_conversation_id(conversation_id: str | None) -> str | None:
     return conversation_id or os.environ.get("GROK_SESSION_ID")
+
+
+def _entry_cwd_matches(entry_cwd: str | None, workspace: str) -> bool:
+    if not entry_cwd:
+        return False
+    normalized_entry = normalize_workspace(entry_cwd)
+    normalized_workspace = normalize_workspace(workspace)
+    if not normalized_entry or not normalized_workspace:
+        return False
+    return normalized_entry == normalized_workspace
+
+
+def _filter_active_entries(
+    entries: list,
+    workspace: str | None,
+) -> list[dict]:
+    valid = [e for e in entries if isinstance(e, dict) and e.get("session_id")]
+    if not workspace:
+        return valid
+
+    norm_ws = normalize_workspace(workspace)
+    if not norm_ws:
+        return valid
+
+    return [e for e in valid if _entry_cwd_matches(e.get("cwd"), norm_ws)]
+
+
+def _pick_active_entry(entries: list[dict], warnings: list[str]) -> dict | None:
+    if not entries:
+        return None
+    if len(entries) == 1:
+        return entries[0]
+
+    warnings.append("grok_multiple_active_sessions")
+    return max(entries, key=lambda e: e.get("opened_at", ""))
 
 
 def resolve_grok_session_id(
@@ -20,6 +68,7 @@ def resolve_grok_session_id(
 ) -> tuple[str | None, list[str]]:
     """Resolve the Grok session UUID for transcript binding."""
     warnings: list[str] = []
+    workspace = normalize_workspace(workspace)
 
     candidates: list[str] = []
     if conversation_id:
@@ -31,6 +80,9 @@ def resolve_grok_session_id(
     for candidate in candidates:
         if _find_chat_history(candidate):
             return candidate, warnings
+        if conversation_id and candidate == conversation_id:
+            return candidate, warnings
+
     if conversation_id:
         warnings.append("grok_conversation_not_found")
         return None, warnings
@@ -52,28 +104,31 @@ def resolve_grok_session_id(
         warnings.append("grok_active_sessions_invalid")
         return None, warnings
 
-    if workspace:
-        entries = [e for e in entries if isinstance(e, dict) and e.get("cwd") == workspace]
-
-    session_ids = [
-        e.get("session_id")
-        for e in entries
-        if isinstance(e, dict) and e.get("session_id")
-    ]
-
-    if len(session_ids) == 1:
-        sid = session_ids[0]
-        if sid and _find_chat_history(sid):
-            return sid, warnings
-        warnings.append("grok_active_session_transcript_missing")
+    filtered = _filter_active_entries(entries, workspace)
+    entry = _pick_active_entry(filtered, warnings)
+    if not entry:
+        warnings.append("grok_no_active_session")
         return None, warnings
 
-    if len(session_ids) > 1:
-        warnings.append("grok_multiple_active_sessions")
+    sid = entry.get("session_id")
+    if not sid:
+        warnings.append("grok_no_active_session")
         return None, warnings
 
-    warnings.append("grok_no_active_session")
-    return None, warnings
+    if not _find_chat_history(sid):
+        warnings.append("grok_transcript_pending")
+
+    return sid, warnings
+
+
+def _read_group_cwd(group_dir: Path) -> str | None:
+    cwd_file = group_dir / ".cwd"
+    if not cwd_file.is_file():
+        return None
+    try:
+        return normalize_workspace(cwd_file.read_text(encoding="utf-8").strip())
+    except OSError:
+        return None
 
 
 def _find_chat_history(conversation_id: str) -> Path | None:

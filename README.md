@@ -65,7 +65,7 @@ Para clientes que arrancan el servidor como subproceso:
 
 ## 🧪 Pruebas Unitarias
 
-El proyecto cuenta con una batería de **258 pruebas unitarias** que cubren el ciclo de vida completo de la base de datos, el cliente Ollama, la consolidación por LLM, el proveedor de transcripts Grok CLI y las herramientas MCP.
+El proyecto cuenta con una batería de **266 pruebas unitarias** que cubren el ciclo de vida completo de la base de datos, el cliente Ollama, la consolidación por LLM, el proveedor de transcripts Grok CLI y las herramientas MCP.
 
 ```bash
 # Ejecutar la suite completa

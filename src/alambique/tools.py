@@ -558,8 +558,12 @@ class ToolHandler:
             return None, None, warnings
 
         if client == "grok":
-            from alambique.transcripts.grok_cli import resolve_grok_session_id
+            from alambique.transcripts.grok_cli import (
+                normalize_workspace,
+                resolve_grok_session_id,
+            )
 
+            workspace = normalize_workspace(workspace)
             if not workspace and not conversation_id:
                 warnings.append("binding_missing_workspace")
             resolved, resolve_warnings = resolve_grok_session_id(
@@ -600,6 +604,24 @@ class ToolHandler:
             client, conversation_id, workspace
         )
         warnings.extend(bind_warnings)
+
+        binding_failed = bound_client is not None and bound_conversation_id is None
+        if binding_failed:
+            async with self._db_guard():
+                self._seed_persona_if_needed(persona_seed)
+            persona, persona_warnings = await self._compose_session_persona()
+            warnings.extend(persona_warnings)
+            return SessionStartOutput(
+                session_id=None,
+                status="error",
+                persona=persona,
+                client=bound_client,
+                conversation_id=None,
+                session_reused=False,
+                is_new=False,
+                degraded=True,
+                warnings=warnings,
+            )
 
         session_reused = False
         async with self._db_guard():
