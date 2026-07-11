@@ -176,8 +176,12 @@ def _parse_transcript(path: Path) -> list[dict[str, str]]:
                 if clean_content:
                     messages.append({"role": "user", "content": clean_content})
 
-            elif step_type == "PLANNER_RESPONSE" or source == "MODEL":
+            elif step_type == "PLANNER_RESPONSE":
+                if step.get("tool_calls"):
+                    continue
                 if isinstance(content, str) and content.strip():
+                    if content.strip() == '{"ok": true}':
+                        continue
                     messages.append({"role": "assistant", "content": content})
 
     return messages

@@ -394,6 +394,148 @@ class TestSessionStartBinding:
             if brain.parent.exists():
                 shutil.rmtree(brain.parent)
 
+    def test_session_start_binds_opencode_conversation(self, tools, monkeypatch, tmp_path):
+        import json
+        import sqlite3
+
+        test_conv_id = "ses_opencode_bind_001"
+        workspace = "/tmp/alambique-opencode-bind"
+        data_dir = tmp_path / "opencode"
+        data_dir.mkdir(parents=True)
+        db_path = data_dir / "opencode.db"
+
+        conn = sqlite3.connect(db_path)
+        conn.executescript(
+            """
+            CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                directory TEXT NOT NULL,
+                time_updated INTEGER NOT NULL
+            );
+            CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            CREATE TABLE part (
+                id TEXT PRIMARY KEY,
+                message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO session (id, directory, time_updated) VALUES (?, ?, ?)",
+            (test_conv_id, workspace, 1),
+        )
+        conn.commit()
+        conn.close()
+
+        monkeypatch.setattr(
+            "alambique.transcripts.opencode_cli.OPENCODE_DATA",
+            data_dir,
+        )
+
+        result = asyncio.run(
+            tools.session_start(client="opencode", workspace=workspace)
+        )
+        stored = tools.db.get_session(result.session_id)
+        assert stored.client == "opencode"
+        assert stored.conversation_id == test_conv_id
+        assert result.conversation_id == test_conv_id
+
+    def test_session_end_with_opencode_transcript_sync(self, tools, monkeypatch, tmp_path):
+        import json
+        import sqlite3
+
+        test_conv_id = "ses_opencode_sync_001"
+        workspace = "/tmp/alambique-opencode-sync"
+        data_dir = tmp_path / "opencode"
+        data_dir.mkdir(parents=True)
+        db_path = data_dir / "opencode.db"
+
+        conn = sqlite3.connect(db_path)
+        conn.executescript(
+            """
+            CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                directory TEXT NOT NULL,
+                time_updated INTEGER NOT NULL
+            );
+            CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            CREATE TABLE part (
+                id TEXT PRIMARY KEY,
+                message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO session (id, directory, time_updated) VALUES (?, ?, ?)",
+            (test_conv_id, workspace, 1),
+        )
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES (?, ?, ?, ?)",
+            ("msg_u", test_conv_id, 1, json.dumps({"role": "user"})),
+        )
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES (?, ?, ?, ?)",
+            (
+                "msg_a",
+                test_conv_id,
+                2,
+                json.dumps({"role": "assistant", "finish": "stop"}),
+            ),
+        )
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, time_created, data) VALUES (?, ?, ?, ?, ?)",
+            (
+                "part_u",
+                "msg_u",
+                test_conv_id,
+                1,
+                json.dumps({"type": "text", "text": "Hola Lucy."}),
+            ),
+        )
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, time_created, data) VALUES (?, ?, ?, ?, ?)",
+            (
+                "part_a",
+                "msg_a",
+                test_conv_id,
+                2,
+                json.dumps({"type": "text", "text": "¡Hola, Víctor!"}),
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        monkeypatch.setattr(
+            "alambique.transcripts.opencode_cli.OPENCODE_DATA",
+            data_dir,
+        )
+
+        result = asyncio.run(
+            tools.session_start(client="opencode", workspace=workspace)
+        )
+        asyncio.run(tools.session_end(result.session_id))
+
+        msgs = tools.db.get_session_messages(result.session_id)
+        assert len(msgs) == 2
+        assert msgs[0].role == "user"
+        assert msgs[0].content == "Hola Lucy."
+        assert msgs[1].content == "¡Hola, Víctor!"
+
     def test_session_end_uses_stored_binding(self, tools, monkeypatch):
         from pathlib import Path
         import shutil
@@ -518,11 +660,10 @@ class TestSessionEnd:
             asyncio.run(tools.session_end(r.session_id))
 
             msgs = tools.db.get_session_messages(r.session_id)
-            assert len(msgs) == 3
+            assert len(msgs) == 2
             assert msgs[0].role == "user"
             assert msgs[0].content == "Hola Lucy."
-            assert msgs[1].content == "Checking status"
-            assert msgs[2].content == "¡Hola, Víctor! ¿Cómo estás?"
+            assert msgs[1].content == "¡Hola, Víctor! ¿Cómo estás?"
         finally:
             if history_backup is None:
                 history_path.unlink(missing_ok=True)

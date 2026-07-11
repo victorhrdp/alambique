@@ -74,7 +74,7 @@ TOOL_DEFINITIONS = [
                 },
                 "client": {
                     "type": "string",
-                    "description": "Cliente emisor (ej: grok, antigravity_cli). Enlaza el transcript externo al abrir.",
+                    "description": "Cliente emisor (ej: grok, antigravity_cli, opencode). Enlaza el transcript externo al abrir.",
                 },
                 "conversation_id": {
                     "type": "string",

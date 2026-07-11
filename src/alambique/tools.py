@@ -593,6 +593,22 @@ class ToolHandler:
                 warnings.append("binding_failed")
             return client, resolved, warnings
 
+        if client == "opencode":
+            from alambique.transcripts.grok_cli import normalize_workspace as normalize_ws
+            from alambique.transcripts.opencode_cli import resolve_opencode_session_id
+
+            workspace = normalize_ws(workspace)
+            if not workspace and not conversation_id:
+                warnings.append("binding_missing_workspace")
+            resolved, resolve_warnings = resolve_opencode_session_id(
+                conversation_id=conversation_id,
+                workspace=workspace,
+            )
+            warnings.extend(resolve_warnings)
+            if not resolved:
+                warnings.append("binding_failed")
+            return client, resolved, warnings
+
         resolved = conversation_id
         if not resolved:
             warnings.append("binding_failed")

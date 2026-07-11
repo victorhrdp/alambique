@@ -10,27 +10,49 @@ from alambique.transcripts.antigravity_cli import (
 
 
 class TestParseTranscript:
-    def test_keeps_assistant_content_with_tool_calls(self, tmp_path):
+    def test_skips_planner_with_tool_calls(self, tmp_path):
         path = tmp_path / "transcript_full.jsonl"
         records = [
             {
                 "type": "PLANNER_RESPONSE",
                 "source": "MODEL",
-                "content": "Arranco Alambique.",
+                "content": "I will read the skill file.",
                 "tool_calls": [{"name": "view_file"}],
             },
             {
                 "type": "PLANNER_RESPONSE",
                 "source": "MODEL",
-                "content": "Listo.",
+                "content": "Listo, Víctor.",
             },
         ]
         path.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
 
         messages = _parse_transcript(path)
-        assert len(messages) == 2
-        assert messages[0] == {"role": "assistant", "content": "Arranco Alambique."}
-        assert messages[1] == {"role": "assistant", "content": "Listo."}
+        assert messages == [{"role": "assistant", "content": "Listo, Víctor."}]
+
+    def test_excludes_tool_output_steps(self, tmp_path):
+        path = tmp_path / "transcript_full.jsonl"
+        records = [
+            {
+                "type": "VIEW_FILE",
+                "source": "MODEL",
+                "content": "Created At: ...\nFile Path: SKILL.md\n1: ---",
+            },
+            {
+                "type": "MCP_TOOL",
+                "source": "MODEL",
+                "content": '{"session_id": "sess_x", "status": "ok"}',
+            },
+            {
+                "type": "PLANNER_RESPONSE",
+                "source": "MODEL",
+                "content": "¡Hola, Víctor!",
+            },
+        ]
+        path.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+
+        messages = _parse_transcript(path)
+        assert messages == [{"role": "assistant", "content": "¡Hola, Víctor!"}]
 
     def test_extracts_user_request(self, tmp_path):
         path = tmp_path / "transcript_full.jsonl"

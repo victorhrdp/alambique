@@ -1,6 +1,6 @@
 # Alambique — Memoria para Lucy
 
-Memoria semántica y episódica para el asistente virtual **Lucy** (v0.2.1 — Grok + Antigravity CLI). Destila conversaciones en hechos atómicos y mantiene la continuidad de su personalidad usando LLMs y búsqueda vectorial local.
+Memoria semántica y episódica para el asistente virtual **Lucy** (v0.2.3 — Grok + Antigravity CLI + OpenCode). Destila conversaciones en hechos atómicos y mantiene la continuidad de su personalidad usando LLMs y búsqueda vectorial local.
 
 ## Arquitectura
 
@@ -9,7 +9,7 @@ Memoria semántica y episódica para el asistente virtual **Lucy** (v0.2.1 — G
 | Persistencia | SQLite WAL + `sqlite-vec` | Sesiones, mensajes, hechos, embeddings |
 | Embeddings | Ollama `bge-m3` (1024d) | Búsqueda semántica local |
 | Razonamiento | OpenCode Go `qwen3.7-plus` | Consolidación y recall narrativo |
-| Transcripts | `GrokCliProvider`, `AntigravityCliProvider` | Importación batch al cerrar sesión |
+| Transcripts | `GrokCliProvider`, `AntigravityCliProvider`, `OpenCodeCliProvider` | Importación batch al cerrar sesión |
 | Daemon | MCP SSE en `:9042` | 12 herramientas + watchdog + consolidación async |
 
 Ámbito exclusivo Lucy — sin namespaces ni multi-agente.
@@ -87,6 +87,20 @@ Transcript en `~/.gemini/antigravity-cli/brain/<conversation-id>/.system_generat
 3. **`session_end`** — solo `session_id` de Alambique.
 
 MCP en `~/.gemini/antigravity-cli/mcp_config.json` → `http://localhost:9042/sse`.
+
+Filtro de diálogo: `USER_INPUT` + `PLANNER_RESPONSE` sin `tool_calls` (excluye monólogo interno y dumps de herramientas).
+
+### OpenCode
+
+Transcript en `~/.local/share/opencode/opencode.db` (tablas `session`, `message`, `part`).
+
+1. **`session_start`** — `client="opencode"`, `workspace=<cwd absoluto>`. Resuelve `conversation_id` (`ses_…`) por `session.directory` (sesión más reciente por `time_updated`).
+2. **Conversación** — OpenCode escribe en SQLite.
+3. **`session_end`** — solo `session_id` de Alambique.
+
+MCP en `~/.config/opencode/opencode.jsonc` → `http://localhost:9042/sse`.
+
+Filtro de diálogo: mensajes `user` con partes `text`; asistente solo con `finish != tool-calls` (respuesta final visible).
 
 ### Respuestas clave
 
