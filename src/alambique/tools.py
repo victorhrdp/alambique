@@ -44,7 +44,6 @@ from alambique.models import (
     MemoryRecallOutput,
     MemoryStatusOutput,
     Message,
-    MessageAppendOutput,
     SessionEndOutput,
     SessionStartOutput,
     SessionStatus,
@@ -53,9 +52,6 @@ from alambique.ollama_client import OllamaClient
 from alambique.recall import RecallClient
 
 logger = logging.getLogger("alambique.tools")
-
-SESSION_LIMIT = 200
-SESSION_WARNING_AT = 180
 
 
 def consolidation_search_text(messages: list[Message], *, max_chars: int = 8000) -> str:
@@ -144,6 +140,19 @@ class ToolHandler:
         if self._recall:
             await self._recall.close()
 
+    async def shutdown_open_sessions(self) -> None:
+        """Sync and close open sessions before daemon shutdown."""
+        async with self._db_guard():
+            open_sessions = self.db.get_open_sessions()
+        for session in open_sessions:
+            logger.info("Shutdown: cerrando sesión abierta %s", session.id)
+            await self._close_session(
+                session.id,
+                SessionStatus.TRUNCATED,
+                conversation_id=session.conversation_id,
+                client=session.client,
+            )
+
     async def _consolidation_loop(self) -> None:
         """Process pending consolidations sequentially."""
         while True:
@@ -176,14 +185,19 @@ class ToolHandler:
                 await asyncio.sleep(10)
 
     async def _watchdog_loop(self) -> None:
-        """Detect stale sessions and mark them truncated."""
+        """Detect stale sessions, sync transcript if bound, then mark truncated."""
         while True:
             try:
                 async with self._db_guard():
                     stale = self.db.find_stale_sessions(timeout_minutes=30)
-                    for s in stale:
-                        logger.info("Watchdog: marcando sesión %s como truncated", s.id)
-                        self.db.close_session(s.id, SessionStatus.TRUNCATED)
+                for s in stale:
+                    logger.info("Watchdog: cerrando sesión obsoleta %s (truncated)", s.id)
+                    await self._close_session(
+                        s.id,
+                        SessionStatus.TRUNCATED,
+                        conversation_id=s.conversation_id,
+                        client=s.client,
+                    )
             except asyncio.CancelledError:
                 return
             except Exception as e:
@@ -194,14 +208,35 @@ class ToolHandler:
         """Run consolidation on a session."""
         async with self._db_guard():
             messages = self.db.get_session_messages(session.id)
-            if not messages:
-                self.db.set_session_summary(session.id, "(sesión vacía)")
-                return
+
+        if not messages and session.client and session.conversation_id:
+            await self._sync_session_transcript(
+                session.id,
+                session.conversation_id,
+                session.client,
+            )
+            async with self._db_guard():
+                messages = self.db.get_session_messages(session.id)
+
+        if not messages:
+            async with self._db_guard():
+                if session.client and session.conversation_id:
+                    self.db.set_session_summary(
+                        session.id, "(transcript vacío tras sync)"
+                    )
+                else:
+                    self.db.set_session_summary(session.id, "(sesión vacía)")
+            return
 
         consolidation_msgs = messages_for_consolidation(messages)
         if not consolidation_msgs:
             async with self._db_guard():
-                self.db.set_session_summary(session.id, "(sin mensajes consolidables)")
+                if session.client and session.conversation_id:
+                    self.db.set_session_summary(
+                        session.id, "(sin mensajes consolidables tras sync)"
+                    )
+                else:
+                    self.db.set_session_summary(session.id, "(sin mensajes consolidables)")
             return
 
         existing_facts, fact_warnings = await self._facts_for_consolidation(consolidation_msgs)
@@ -509,9 +544,51 @@ class ToolHandler:
 
         return None, warnings
 
+    def _resolve_client_binding(
+        self,
+        client: str | None,
+        conversation_id: str | None,
+        workspace: str | None,
+    ) -> tuple[str | None, str | None, list[str]]:
+        import os
+
+        warnings: list[str] = []
+        if not client:
+            warnings.append("binding_missing_client")
+            return None, None, warnings
+
+        if client == "grok":
+            from alambique.transcripts.grok_cli import resolve_grok_session_id
+
+            if not workspace and not conversation_id:
+                warnings.append("binding_missing_workspace")
+            resolved, resolve_warnings = resolve_grok_session_id(
+                conversation_id=conversation_id,
+                workspace=workspace,
+            )
+            warnings.extend(resolve_warnings)
+            if not resolved:
+                warnings.append("binding_failed")
+            return client, resolved, warnings
+
+        if client == "antigravity_cli":
+            resolved = conversation_id or os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
+            if not resolved:
+                warnings.append("antigravity_conversation_missing")
+                warnings.append("binding_failed")
+            return client, resolved, warnings
+
+        resolved = conversation_id
+        if not resolved:
+            warnings.append("binding_failed")
+        return client, resolved, warnings
+
     async def session_start(
         self,
         persona_seed: str | None = None,
+        client: str | None = None,
+        conversation_id: str | None = None,
+        workspace: str | None = None,
     ) -> SessionStartOutput:
         warnings: list[str] = []
         if not self.online:
@@ -519,10 +596,39 @@ class ToolHandler:
         if not await self.ollama.health():
             warnings.append("ollama_unavailable")
 
+        bound_client, bound_conversation_id, bind_warnings = self._resolve_client_binding(
+            client, conversation_id, workspace
+        )
+        warnings.extend(bind_warnings)
+
+        session_reused = False
         async with self._db_guard():
             already_existed = len(self.db.get_all_sessions()) > 0
             self._seed_persona_if_needed(persona_seed)
-            session = self.db.create_session()
+
+            if bound_client and bound_conversation_id:
+                existing = self.db.get_open_session_by_binding(
+                    bound_client, bound_conversation_id
+                )
+                if existing:
+                    session = existing
+                    session_reused = True
+                    warnings.append("session_reused")
+                    for duplicate in self.db.get_open_sessions_by_binding(
+                        bound_client, bound_conversation_id
+                    ):
+                        if duplicate.id != existing.id:
+                            self.db.close_session(duplicate.id, SessionStatus.TRUNCATED)
+                else:
+                    session = self.db.create_session(
+                        client=bound_client,
+                        conversation_id=bound_conversation_id,
+                    )
+            else:
+                session = self.db.create_session(
+                    client=bound_client,
+                    conversation_id=bound_conversation_id,
+                )
         persona, persona_warnings = await self._compose_session_persona()
         warnings.extend(persona_warnings)
 
@@ -530,62 +636,93 @@ class ToolHandler:
             session_id=session.id,
             status="ok",
             persona=persona,
-            is_new=not already_existed,
+            client=bound_client,
+            conversation_id=bound_conversation_id,
+            session_reused=session_reused,
+            is_new=not already_existed and not session_reused,
             degraded=bool(warnings),
             warnings=warnings,
         )
 
-    # ── tool: message_append ────────────────────────────────────
-
-    async def message_append(
+    async def _sync_session_transcript(
         self,
         session_id: str,
-        role: str,
-        content: str,
-        tool_calls: str | None = None,
-        tool_results: str | None = None,
-    ) -> MessageAppendOutput:
+        conversation_id: str | None = None,
+        client: str | None = None,
+    ) -> int:
+        """Import messages from the bound external transcript, if available."""
+        import os
+        from alambique.transcripts import get_active_provider
+
         async with self._db_guard():
-            session = self.db.get_session(session_id)
-            if session is None or session.status != SessionStatus.OPEN:
-                return MessageAppendOutput(
-                    ok=False,
-                    action="new_session_required",
-                    warning="Sesión no activa",
-                )
+            stored = self.db.get_session(session_id)
 
-            tc = json.dumps(tool_calls) if isinstance(tool_calls, (dict, list)) else tool_calls
-            tr = json.dumps(tool_results) if isinstance(tool_results, (dict, list)) else tool_results
+        effective_client = client or (stored.client if stored else None)
+        conv_id = (
+            conversation_id
+            or (stored.conversation_id if stored else None)
+            or os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
+            or os.environ.get("GROK_SESSION_ID")
+        )
+        if not conv_id and effective_client == "grok":
+            from alambique.transcripts.grok_cli import resolve_grok_session_id
 
-            msg = Message(
-                session_id=session_id,
-                role=role,
-                content=content,
-                tool_calls=tc,
-                tool_results=tr,
+            conv_id, _ = resolve_grok_session_id()
+        provider = get_active_provider(conv_id, effective_client)
+        if not provider:
+            logger.info(
+                "No active transcript provider for session %s; keeping existing messages.",
+                session_id,
             )
-            self.db.append_message(msg)
+            return 0
 
-            count = self.db.session_message_count(session_id)
-            remaining = SESSION_LIMIT - count
+        try:
+            raw_messages = provider.get_messages(conv_id)
+            if not raw_messages:
+                return 0
 
-            output = MessageAppendOutput(messages_remaining=remaining)
+            db_messages = [
+                Message(session_id=session_id, role=m["role"], content=m["content"])
+                for m in raw_messages
+            ]
+            async with self._db_guard():
+                self.db.clear_and_set_session_messages(session_id, db_messages)
+            logger.info(
+                "Sincronizados %d mensajes automáticamente usando %s",
+                len(db_messages),
+                provider.__class__.__name__,
+            )
+            return len(db_messages)
+        except Exception as e:
+            logger.error(
+                "Error al sincronizar mensajes del transcript para sesión %s: %s",
+                session_id,
+                e,
+            )
+            return 0
 
-            if count >= SESSION_LIMIT:
-                self.db.close_session(session_id, SessionStatus.CLOSED)
-                output.warning = "Sesión cerrada (límite alcanzado)"
-                output.messages_remaining = 0
-            elif count >= SESSION_WARNING_AT:
-                output.warning = f"Límite en {remaining} mensajes"
-
-            return output
+    async def _close_session(
+        self,
+        session_id: str,
+        status: SessionStatus,
+        conversation_id: str | None = None,
+        client: str | None = None,
+    ) -> None:
+        await self._sync_session_transcript(session_id, conversation_id, client)
+        async with self._db_guard():
+            self.db.close_session(session_id, status)
 
     # ── tool: session_end ───────────────────────────────────────
 
-    async def session_end(self, session_id: str, truncated: bool = False) -> SessionEndOutput:
+    async def session_end(
+        self,
+        session_id: str,
+        truncated: bool = False,
+        conversation_id: str | None = None,
+        client: str | None = None,
+    ) -> SessionEndOutput:
         status = SessionStatus.TRUNCATED if truncated else SessionStatus.CLOSED
-        async with self._db_guard():
-            self.db.close_session(session_id, status)
+        await self._close_session(session_id, status, conversation_id, client)
         return SessionEndOutput()
 
     # ── tool: memory_recall ─────────────────────────────────────
@@ -698,6 +835,8 @@ class ToolHandler:
 
             return MemoryContextOutput(
                 session_summary=session.summary,
+                client=session.client,
+                conversation_id=session.conversation_id,
                 messages=[
                     {"role": m.role, "content": m.content, "timestamp": m.timestamp}
                     for m in msgs
@@ -857,6 +996,8 @@ class ToolHandler:
                 {
                     "id": s.id,
                     "status": s.status.value,
+                    "client": s.client,
+                    "conversation_id": s.conversation_id,
                     "summary": s.summary,
                     "created_at": s.created_at.isoformat() if s.created_at else None,
                     "ended_at": s.ended_at.isoformat() if s.ended_at else None,
@@ -892,6 +1033,8 @@ class ToolHandler:
                 {
                     "id": s.id,
                     "status": s.status.value,
+                    "client": s.client,
+                    "conversation_id": s.conversation_id,
                     "summary": s.summary,
                     "created_at": s.created_at.isoformat() if s.created_at else None,
                     "ended_at": s.ended_at.isoformat() if s.ended_at else None,

@@ -26,7 +26,7 @@ from alambique.models import (
 
 logger = logging.getLogger("alambique.db")
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 FACTS_KEY_ACTIVE_INDEX_SQL = (
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_key_active "
@@ -35,12 +35,14 @@ FACTS_KEY_ACTIVE_INDEX_SQL = (
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS sessions (
-    id            TEXT PRIMARY KEY,
-    status        TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','closed','truncated')),
-    consolidated  INTEGER NOT NULL DEFAULT 0,
-    summary       TEXT,
-    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
-    ended_at      TEXT
+    id                TEXT PRIMARY KEY,
+    status            TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','closed','truncated')),
+    consolidated      INTEGER NOT NULL DEFAULT 0,
+    summary           TEXT,
+    client            TEXT,
+    conversation_id   TEXT,
+    created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    ended_at          TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -141,6 +143,9 @@ class Database:
             current = 3
         if current < 4:
             self._migrate_v3_to_v4()
+            current = 4
+        if current < 5:
+            self._migrate_v4_to_v5()
 
     def _backup_database(self) -> Path:
         """Copy the database (and WAL sidecars) before a schema migration."""
@@ -288,6 +293,18 @@ class Database:
         self.conn.commit()
         logger.info("Migración v3→v4 completada.")
 
+    def _migrate_v4_to_v5(self) -> None:
+        """Add client/conversation_id binding columns to sessions."""
+        self._backup_database()
+        logger.info("Migrando de v4 a v5 (binding client/conversation_id en sessions)...")
+        if not self._column_exists("sessions", "client"):
+            self.conn.execute("ALTER TABLE sessions ADD COLUMN client TEXT")
+        if not self._column_exists("sessions", "conversation_id"):
+            self.conn.execute("ALTER TABLE sessions ADD COLUMN conversation_id TEXT")
+        self.conn.execute("PRAGMA user_version = 5")
+        self.conn.commit()
+        logger.info("Migración v4→v5 completada.")
+
     def _ensure_facts_key_index(self) -> None:
         self.conn.execute(FACTS_KEY_ACTIVE_INDEX_SQL)
         self.conn.commit()
@@ -326,11 +343,15 @@ class Database:
 
     # ── sessions ───────────────────────────────────────────────
 
-    def create_session(self) -> Session:
+    def create_session(
+        self,
+        client: str | None = None,
+        conversation_id: str | None = None,
+    ) -> Session:
         sid = f"sess_{uuid.uuid4().hex[:12]}"
         self.conn.execute(
-            "INSERT INTO sessions (id, status) VALUES (?, 'open')",
-            (sid,),
+            "INSERT INTO sessions (id, status, client, conversation_id) VALUES (?, 'open', ?, ?)",
+            (sid, client, conversation_id),
         )
         self.conn.commit()
         return self.get_session(sid)
@@ -350,6 +371,29 @@ class Database:
         if row is None:
             return None
         return Session(**dict(row))
+
+    def get_open_sessions_by_binding(
+        self, client: str, conversation_id: str
+    ) -> list[Session]:
+        rows = self.conn.execute(
+            "SELECT * FROM sessions WHERE status = 'open' "
+            "AND client = ? AND conversation_id = ? "
+            "ORDER BY created_at DESC",
+            (client, conversation_id),
+        ).fetchall()
+        return [Session(**dict(r)) for r in rows]
+
+    def get_open_session_by_binding(
+        self, client: str, conversation_id: str
+    ) -> Session | None:
+        sessions = self.get_open_sessions_by_binding(client, conversation_id)
+        return sessions[0] if sessions else None
+
+    def get_open_sessions(self) -> list[Session]:
+        rows = self.conn.execute(
+            "SELECT * FROM sessions WHERE status = 'open' ORDER BY created_at"
+        ).fetchall()
+        return [Session(**dict(r)) for r in rows]
 
     def close_session(
         self, session_id: str, status: SessionStatus = SessionStatus.CLOSED
@@ -405,6 +449,16 @@ class Database:
         )
         self.conn.commit()
         return cur.lastrowid
+
+    def clear_and_set_session_messages(self, session_id: str, messages: list[Message]) -> None:
+        self.conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+        for msg in messages:
+            self.conn.execute(
+                "INSERT INTO messages (session_id, role, content, tool_calls, tool_results) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (msg.session_id, msg.role, msg.content, msg.tool_calls, msg.tool_results),
+            )
+        self.conn.commit()
 
     def get_session_messages(self, session_id: str) -> list[Message]:
         rows = self.conn.execute(

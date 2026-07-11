@@ -609,3 +609,24 @@ class TestV3ToV4Migration:
         )
         assert cid > 0
         d2.close()
+
+
+class TestV4ToV5Migration:
+    def test_adds_session_binding_columns(self, tmp_path):
+        path = tmp_path / "v4_legacy.db"
+        d = Database(path)
+        d.connect()
+        d.conn.execute("PRAGMA user_version = 4")
+        d.conn.commit()
+        d.close()
+
+        d2 = Database(path)
+        d2.connect()
+        assert d2.conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert d2._column_exists("sessions", "client")
+        assert d2._column_exists("sessions", "conversation_id")
+
+        s = d2.create_session(client="grok", conversation_id="abc-123")
+        assert s.client == "grok"
+        assert s.conversation_id == "abc-123"
+        d2.close()

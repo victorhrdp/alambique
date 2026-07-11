@@ -14,7 +14,6 @@ from alambique.models import (
     FactCategory,
     MemoryRecallOutput,
     Message,
-    MessageAppendOutput,
     Session,
     SessionEndOutput,
     SessionStartOutput,
@@ -110,21 +109,6 @@ class TestMCPOutputModels:
         )
         assert o.is_new is True
         assert o.persona is None
-
-    def test_message_append_with_warning(self):
-        o = MessageAppendOutput(
-            messages_remaining=20,
-            warning="Límite en 20 mensajes",
-        )
-        assert o.messages_remaining == 20
-        assert "20" in o.warning
-
-    def test_message_append_limit_reached(self):
-        o = MessageAppendOutput(
-            messages_remaining=0,
-            warning="Sesión cerrada (límite alcanzado)",
-        )
-        assert o.messages_remaining == 0
 
     def test_session_end(self):
         o = SessionEndOutput()

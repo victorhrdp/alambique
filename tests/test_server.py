@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from alambique.server import TOOL_DEFINITIONS, _register_handlers
-from alambique.models import SessionStartOutput, MessageAppendOutput, MemoryRecallOutput
+from alambique.models import SessionStartOutput, MemoryRecallOutput
 from alambique.tools import ToolHandler
 
 
@@ -31,13 +31,13 @@ def _make_fake_server():
 
 
 class TestToolDefinitions:
-    def test_thirteen_tools_defined(self):
-        assert len(TOOL_DEFINITIONS) == 13
+    def test_twelve_tools_defined(self):
+        assert len(TOOL_DEFINITIONS) == 12
 
     def test_all_tool_names(self):
         names = {t.name for t in TOOL_DEFINITIONS}
         expected = {
-            "session_start", "message_append", "session_end",
+            "session_start", "session_end",
             "memory_recall", "memory_search", "memory_forget",
             "memory_export", "memory_status", "memory_health",
             "memory_reembed", "memory_deduplicate",
@@ -52,11 +52,9 @@ class TestToolDefinitions:
     def test_session_start_persona_seed_optional(self):
         t = next(t for t in TOOL_DEFINITIONS if t.name == "session_start")
         assert "persona_seed" in t.inputSchema["properties"]
+        assert "client" in t.inputSchema["properties"]
+        assert "workspace" in t.inputSchema["properties"]
         assert "persona_seed" not in t.inputSchema.get("required", [])
-
-    def test_message_append_required_fields(self):
-        t = next(t for t in TOOL_DEFINITIONS if t.name == "message_append")
-        assert set(t.inputSchema["required"]) == {"session_id", "role", "content"}
 
     def test_memory_recall_query_required(self):
         t = next(t for t in TOOL_DEFINITIONS if t.name == "memory_recall")
@@ -86,7 +84,7 @@ class TestRegisterHandlers:
         result = loop.run_until_complete(handlers["list_tools"](None))
         loop.close()
 
-        assert len(result) == 13
+        assert len(result) == 12
 
 
 class TestToolDispatch:
@@ -107,7 +105,12 @@ class TestToolDispatch:
         )
         loop.close()
 
-        tools.session_start.assert_called_once_with(None)
+        tools.session_start.assert_called_once_with(
+            persona_seed=None,
+            client=None,
+            conversation_id=None,
+            workspace=None,
+        )
         assert len(result) == 1
         data = json.loads(result[0].text)
         assert data["status"] == "ok"
@@ -124,33 +127,14 @@ class TestToolDispatch:
         )
         loop.close()
 
-        tools.session_start.assert_called_once_with("Eres Lucy.")
+        tools.session_start.assert_called_once_with(
+            persona_seed="Eres Lucy.",
+            client=None,
+            conversation_id=None,
+            workspace=None,
+        )
         data = json.loads(result[0].text)
         assert data["status"] == "ok"
-
-    def test_message_append_dispatched(self, dispatch):
-        call_tool, tools = dispatch
-        tools.message_append = AsyncMock(
-            return_value=MessageAppendOutput(messages_remaining=199)
-        )
-
-        loop = __import__("asyncio").new_event_loop()
-        result = loop.run_until_complete(
-            call_tool("message_append", {
-                "session_id": "sess_abc",
-                "role": "user",
-                "content": "Hola",
-            })
-        )
-        loop.close()
-
-        tools.message_append.assert_called_once_with(
-            session_id="sess_abc",
-            role="user",
-            content="Hola",
-            tool_calls=None,
-            tool_results=None,
-        )
 
     def test_unknown_tool(self, dispatch):
         call_tool, tools = dispatch
@@ -163,23 +147,21 @@ class TestToolDispatch:
 
     def test_value_error_handled(self, dispatch):
         call_tool, tools = dispatch
-        tools.message_append = AsyncMock(
-            side_effect=ValueError("Sesión no activa")
+        tools.memory_recall = AsyncMock(
+            side_effect=ValueError("Invalid query")
         )
 
         loop = __import__("asyncio").new_event_loop()
         result = loop.run_until_complete(
-            call_tool("message_append", {
-                "session_id": "bad",
-                "role": "user",
-                "content": "hi",
+            call_tool("memory_recall", {
+                "query": "hi",
             })
         )
         loop.close()
 
         data = json.loads(result[0].text)
         assert "error" in data
-        assert "Sesión no activa" in data["error"]
+        assert "Invalid query" in data["error"]
 
     def test_generic_exception_handled(self, dispatch):
         call_tool, tools = dispatch

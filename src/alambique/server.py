@@ -60,7 +60,10 @@ class _StreamableHTTPASGIApp:
 TOOL_DEFINITIONS = [
     Tool(
         name="session_start",
-        description="Inicia una sesión de memoria de Lucy. Llámala al inicio de cada conversación.",
+        description=(
+            "Inicia una sesión de memoria de Lucy. Llámala al inicio de cada conversación. "
+            "En Grok, pasa client='grok' y workspace=<cwd> para enlazar el transcript."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
@@ -68,24 +71,22 @@ TOOL_DEFINITIONS = [
                     "type": "string",
                     "description": "Personalidad inicial si aún no hay rasgos guardados. Se persiste como hecho personality.",
                 },
+                "client": {
+                    "type": "string",
+                    "description": "Cliente emisor (ej: grok, antigravity_cli). Enlaza el transcript externo al abrir.",
+                },
+                "conversation_id": {
+                    "type": "string",
+                    "description": "ID externo de la conversación. Opcional si el servidor puede auto-detectarlo.",
+                },
+                "workspace": {
+                    "type": "string",
+                    "description": "Ruta absoluta del workspace. Ayuda a resolver la sesión Grok activa.",
+                },
             },
         },
     ),
-    Tool(
-        name="message_append",
-        description="Añade un mensaje a la sesión activa. OPERACIÓN SILENCIOSA: no requiere respuesta ni confirmación. Tras llamarla, espera al usuario sin decir nada más.",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "session_id": {"type": "string"},
-                "role": {"type": "string", "enum": ["user", "assistant", "system"]},
-                "content": {"type": "string"},
-                "tool_calls": {"type": "string"},
-                "tool_results": {"type": "string"},
-            },
-            "required": ["session_id", "role", "content"],
-        },
-    ),
+
     Tool(
         name="session_end",
         description="Finaliza la sesión y dispara la consolidación.",
@@ -94,6 +95,14 @@ TOOL_DEFINITIONS = [
             "properties": {
                 "session_id": {"type": "string"},
                 "truncated": {"type": "boolean", "default": False},
+                "conversation_id": {
+                    "type": "string",
+                    "description": "ID de la conversación (opcional, se auto-detecta si no se provee)",
+                },
+                "client": {
+                    "type": "string",
+                    "description": "Identificador del cliente o sistema emisor (ej: antigravity_cli, opencode, grok)",
+                },
             },
             "required": ["session_id"],
         },
@@ -343,18 +352,17 @@ def _register_handlers(server: Server, tools: ToolHandler) -> None:
 
     dispatch = {
         "session_start": lambda args: tools.session_start(
-            args.get("persona_seed"),
+            persona_seed=args.get("persona_seed"),
+            client=args.get("client"),
+            conversation_id=args.get("conversation_id"),
+            workspace=args.get("workspace"),
         ),
-        "message_append": lambda args: tools.message_append(
-            session_id=args["session_id"],
-            role=args["role"],
-            content=args["content"],
-            tool_calls=args.get("tool_calls"),
-            tool_results=args.get("tool_results"),
-        ),
+
         "session_end": lambda args: tools.session_end(
             session_id=args["session_id"],
             truncated=args.get("truncated", False),
+            conversation_id=args.get("conversation_id"),
+            client=args.get("client"),
         ),
         "memory_recall": lambda args: tools.memory_recall(
             query=args["query"],
@@ -411,6 +419,7 @@ def _register_handlers(server: Server, tools: ToolHandler) -> None:
 
 
 async def _shutdown(ollama: OllamaClient, tools: ToolHandler, db: Database) -> None:
+    await tools.shutdown_open_sessions()
     await tools.stop_background_tasks()
     await ollama.close()
     db.close()

@@ -37,6 +37,16 @@ systemctl --user status alambique.service
 
 Grok CLI y otros clientes se conectan a esa URL. Tras reiniciar el servicio, abre una conversación nueva en Grok (el MCP de la sesión activa queda roto).
 
+### Grok CLI
+
+Grok persiste el diálogo en `~/.grok/sessions/<cwd-encoded>/<conversation-id>/chat_history.jsonl`. Alambique lo lee al cerrar la sesión — no hay `message_append`.
+
+1. **`session_start`** con `client="grok"` y `workspace=<ruta absoluta del cwd>`. Opcionalmente `conversation_id` si el servidor no puede auto-detectarlo vía `active_sessions.json`.
+2. Conversación normal — Grok escribe el transcript en disco.
+3. **`session_end`** con el `session_id` de Alambique: sincroniza mensajes, cierra y dispara consolidación.
+
+El binding (`client` + `conversation_id`) se guarda al abrir. Si la sesión queda abierta, el watchdog (30 min) sincroniza y trunca antes de consolidar. Al apagar el daemon, las sesiones abiertas se cierran igual.
+
 ### Stdio (desarrollo)
 
 Para clientes que arrancan el servidor como subproceso:
@@ -55,7 +65,7 @@ Para clientes que arrancan el servidor como subproceso:
 
 ## 🧪 Pruebas Unitarias
 
-El proyecto cuenta con una batería de **253 pruebas unitarias** que cubren el ciclo de vida completo de la base de datos, el cliente Ollama, la consolidación por LLM y las herramientas MCP.
+El proyecto cuenta con una batería de **258 pruebas unitarias** que cubren el ciclo de vida completo de la base de datos, el cliente Ollama, la consolidación por LLM, el proveedor de transcripts Grok CLI y las herramientas MCP.
 
 ```bash
 # Ejecutar la suite completa

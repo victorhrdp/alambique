@@ -50,6 +50,8 @@ class Session(BaseModel):
     status: SessionStatus = SessionStatus.OPEN
     consolidated: bool = False
     summary: Optional[str] = None
+    client: Optional[str] = None
+    conversation_id: Optional[str] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(_utc))
     ended_at: Optional[datetime] = None
 
@@ -151,16 +153,12 @@ class SessionStartOutput(BaseModel):
     session_id: Optional[str] = None
     status: str  # "ok"
     persona: Optional[str] = None
+    client: Optional[str] = None
+    conversation_id: Optional[str] = None
+    session_reused: bool = False
     is_new: bool = False
     degraded: bool = False
     warnings: list[str] = Field(default_factory=list)
-
-
-class MessageAppendOutput(BaseModel):
-    ok: bool = True
-    messages_remaining: Optional[int] = None
-    warning: Optional[str] = None
-    action: Optional[str] = None
 
 
 class SessionEndOutput(BaseModel):
@@ -230,6 +228,8 @@ class MemoryHealthOutput(BaseModel):
 
 class MemoryContextOutput(BaseModel):
     session_summary: Optional[str] = None
+    client: Optional[str] = None
+    conversation_id: Optional[str] = None
     messages: list[dict[str, Any]] = Field(default_factory=list)
     total: int = 0
     offset: int = 0

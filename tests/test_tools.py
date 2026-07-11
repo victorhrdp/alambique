@@ -15,7 +15,6 @@ from alambique.models import (
     Fact,
     FactCategory,
     Message,
-    MessageAppendOutput,
     SessionStartOutput,
     SessionEndOutput,
     SessionStatus,
@@ -23,11 +22,13 @@ from alambique.models import (
 )
 from alambique.tools import (
     ToolHandler,
-    SESSION_LIMIT,
-    SESSION_WARNING_AT,
     consolidation_search_text,
     messages_for_consolidation,
 )
+
+
+def append_msg(tools, session_id, role, content):
+    tools.db.append_message(Message(session_id=session_id, role=role, content=content))
 
 
 @pytest.fixture
@@ -201,81 +202,169 @@ class TestSessionStart:
         assert result.persona == "algo"  # fallback al rasgo si falla el LLM
 
 
-# ── message_append ───────────────────────────────────────────────
-
-
-class TestMessageAppend:
-    def test_append_user_message(self, tools):
-        r = asyncio.run(tools.session_start())
-        out = asyncio.run(tools.message_append(r.session_id, "user", "Hola"))
-        assert out.ok is True
-        assert out.messages_remaining == SESSION_LIMIT - 1
-
-    def test_append_assistant_message(self, tools):
-        r = asyncio.run(tools.session_start())
-        asyncio.run(tools.message_append(r.session_id, "user", "Hola"))
-        out = asyncio.run(tools.message_append(r.session_id, "assistant", "Respuesta"))
-        assert out.ok is True
-
-    def test_append_with_tool_calls_json_dict(self, tools):
-        r = asyncio.run(tools.session_start())
-        tc = {"name": "echo", "args": {"text": "hi"}}
-        tr = [{"output": "hi"}]
-        out = asyncio.run(tools.message_append(
-            r.session_id, "assistant", "done",
-            tool_calls=tc, tool_results=tr,
-        ))
-        assert out.ok is True
-        msgs = tools.db.get_session_messages(r.session_id)
-        assert len(msgs) == 1
-        assert '"name"' in msgs[0].tool_calls
-
-    def test_append_with_tool_calls_already_string(self, tools):
-        r = asyncio.run(tools.session_start())
-        out = asyncio.run(tools.message_append(
-            r.session_id, "assistant", "done",
-            tool_calls='[{"name":"x"}]',
-            tool_results='{"ok":true}',
-        ))
-        assert out.ok
-
-    def test_append_to_closed_session_returns_action(self, tools):
-        r = asyncio.run(tools.session_start())
-        asyncio.run(tools.session_end(r.session_id))
-        out = asyncio.run(tools.message_append(r.session_id, "user", "late"))
-        assert out.ok is False
-        assert out.action == "new_session_required"
-        assert "no activa" in (out.warning or "")
-
-    def test_append_to_nonexistent_session_returns_action(self, tools):
-        out = asyncio.run(tools.message_append("bad_id", "user", "hi"))
-        assert out.ok is False
-        assert out.action == "new_session_required"
-        assert "no activa" in (out.warning or "")
-
-    @pytest.mark.slow
-    def test_warning_at_180_messages(self, tools):
-        r = asyncio.run(tools.session_start())
-        for i in range(SESSION_WARNING_AT - 1):
-            asyncio.run(tools.message_append(r.session_id, "user", f"msg{i}"))
-        out = asyncio.run(tools.message_append(r.session_id, "user", "final"))
-        assert out.warning is not None
-        assert "Límite" in out.warning
-
-    @pytest.mark.slow
-    def test_force_close_at_200_messages(self, tools):
-        r = asyncio.run(tools.session_start())
-        for i in range(SESSION_LIMIT - 1):
-            asyncio.run(tools.message_append(r.session_id, "user", f"msg{i}"))
-        out = asyncio.run(tools.message_append(r.session_id, "user", "last"))
-        assert "Sesión cerrada" in out.warning
-        assert out.messages_remaining == 0
-
-        s = tools.db.get_session(r.session_id)
-        assert s.status == SessionStatus.CLOSED
-
-
 # ── session_end ──────────────────────────────────────────────────
+
+
+class TestSessionStartBinding:
+    def test_session_start_without_client_warns(self, tools, mock_ollama):
+        tools._compose_session_persona = AsyncMock(return_value=("persona", []))
+        result = asyncio.run(tools.session_start())
+        assert "binding_missing_client" in result.warnings
+        assert result.degraded is True
+        assert result.conversation_id is None
+
+    def test_session_start_reuses_existing_binding(self, tools, monkeypatch):
+        from pathlib import Path
+        import shutil
+        import json
+        from urllib.parse import quote
+
+        test_conv_id = "test-grok-reuse-001"
+        workspace = "/tmp/alambique-grok-reuse"
+        encoded_cwd = quote(workspace, safe="")
+        session_dir = Path.home() / ".grok" / "sessions" / encoded_cwd / test_conv_id
+        transcript_file = session_dir / "chat_history.jsonl"
+        session_dir.mkdir(parents=True, exist_ok=True)
+        transcript_file.write_text(
+            json.dumps({"type": "assistant", "content": "hola"}) + "\n",
+            encoding="utf-8",
+        )
+
+        active_path = Path.home() / ".grok" / "active_sessions.json"
+        backup = active_path.read_text(encoding="utf-8") if active_path.exists() else None
+        active_path.parent.mkdir(parents=True, exist_ok=True)
+        active_path.write_text(
+            json.dumps(
+                [{"session_id": test_conv_id, "pid": 1, "cwd": workspace, "opened_at": "now"}]
+            ),
+            encoding="utf-8",
+        )
+
+        try:
+            tools._compose_session_persona = AsyncMock(return_value=("persona", []))
+            first = asyncio.run(
+                tools.session_start(client="grok", workspace=workspace)
+            )
+            second = asyncio.run(
+                tools.session_start(client="grok", workspace=workspace)
+            )
+            assert first.session_id == second.session_id
+            assert second.session_reused is True
+            assert "session_reused" in second.warnings
+            open_bound = tools.db.get_open_sessions_by_binding("grok", test_conv_id)
+            assert len(open_bound) == 1
+        finally:
+            if backup is None:
+                active_path.unlink(missing_ok=True)
+            else:
+                active_path.write_text(backup, encoding="utf-8")
+            group_dir = session_dir.parent
+            if group_dir.exists():
+                shutil.rmtree(group_dir)
+
+    def test_session_start_binds_grok_conversation(self, tools, monkeypatch):
+        from pathlib import Path
+        import shutil
+        import json
+        from urllib.parse import quote
+
+        test_conv_id = "test-grok-bind-001"
+        workspace = "/tmp/alambique-grok-bind"
+        encoded_cwd = quote(workspace, safe="")
+        session_dir = Path.home() / ".grok" / "sessions" / encoded_cwd / test_conv_id
+        transcript_file = session_dir / "chat_history.jsonl"
+        session_dir.mkdir(parents=True, exist_ok=True)
+        with open(transcript_file, "w", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "type": "user",
+                        "content": [{"type": "text", "text": "<user_query>\nBind me\n</user_query>"}],
+                    }
+                )
+                + "\n"
+            )
+
+        active_path = Path.home() / ".grok" / "active_sessions.json"
+        backup = active_path.read_text(encoding="utf-8") if active_path.exists() else None
+        active_path.parent.mkdir(parents=True, exist_ok=True)
+        active_path.write_text(
+            json.dumps(
+                [{"session_id": test_conv_id, "pid": 1, "cwd": workspace, "opened_at": "now"}]
+            ),
+            encoding="utf-8",
+        )
+
+        try:
+            result = asyncio.run(
+                tools.session_start(client="grok", workspace=workspace)
+            )
+            stored = tools.db.get_session(result.session_id)
+            assert stored.client == "grok"
+            assert stored.conversation_id == test_conv_id
+            assert result.conversation_id == test_conv_id
+            assert result.client == "grok"
+        finally:
+            if backup is None:
+                active_path.unlink(missing_ok=True)
+            else:
+                active_path.write_text(backup, encoding="utf-8")
+            group_dir = session_dir.parent
+            if group_dir.exists():
+                shutil.rmtree(group_dir)
+
+    def test_session_end_uses_stored_binding(self, tools, monkeypatch):
+        from pathlib import Path
+        import shutil
+        import json
+        from urllib.parse import quote
+
+        test_conv_id = "test-grok-bind-end-002"
+        workspace = "/tmp/alambique-grok-bind-end"
+        encoded_cwd = quote(workspace, safe="")
+        session_dir = Path.home() / ".grok" / "sessions" / encoded_cwd / test_conv_id
+        transcript_file = session_dir / "chat_history.jsonl"
+
+        lines = [
+            {
+                "type": "user",
+                "content": [{"type": "text", "text": "<user_query>\nHola\n</user_query>"}],
+            },
+            {"type": "assistant", "content": "Adiós"},
+        ]
+        session_dir.mkdir(parents=True, exist_ok=True)
+        with open(transcript_file, "w", encoding="utf-8") as f:
+            for line in lines:
+                f.write(json.dumps(line) + "\n")
+
+        active_path = Path.home() / ".grok" / "active_sessions.json"
+        backup = active_path.read_text(encoding="utf-8") if active_path.exists() else None
+        active_path.parent.mkdir(parents=True, exist_ok=True)
+        active_path.write_text(
+            json.dumps(
+                [{"session_id": test_conv_id, "pid": 1, "cwd": workspace, "opened_at": "now"}]
+            ),
+            encoding="utf-8",
+        )
+
+        try:
+            started = asyncio.run(
+                tools.session_start(client="grok", workspace=workspace)
+            )
+            asyncio.run(tools.session_end(started.session_id))
+
+            msgs = tools.db.get_session_messages(started.session_id)
+            assert len(msgs) == 2
+            assert msgs[0].content == "Hola"
+            assert msgs[1].content == "Adiós"
+        finally:
+            if backup is None:
+                active_path.unlink(missing_ok=True)
+            else:
+                active_path.write_text(backup, encoding="utf-8")
+            group_dir = session_dir.parent
+            if group_dir.exists():
+                shutil.rmtree(group_dir)
 
 
 class TestSessionEnd:
@@ -300,6 +389,170 @@ class TestSessionEnd:
         asyncio.run(tools.session_end(r.session_id))
         pending = tools.db.get_pending_consolidations()
         assert len(pending) == 1
+
+    def test_session_end_with_transcript_sync(self, tools, monkeypatch):
+        from pathlib import Path
+        import shutil
+        import json
+
+        test_conv_id = "test-conv-sync-123"
+        log_dir = Path.home() / ".gemini" / "antigravity-cli" / "brain" / test_conv_id / ".system_generated" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        transcript_file = log_dir / "transcript_full.jsonl"
+
+        lines = [
+            {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "<USER_REQUEST>\nHola Lucy.\n</USER_REQUEST>\n"},
+            {"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "content": "Checking status", "tool_calls": [{"name": "some_tool"}]},
+            {"step_index": 2, "source": "MODEL", "type": "PLANNER_RESPONSE", "content": "¡Hola, Víctor! ¿Cómo estás?", "tool_calls": None}
+        ]
+        with open(transcript_file, "w", encoding="utf-8") as f:
+            for line in lines:
+                f.write(json.dumps(line) + "\n")
+
+        monkeypatch.setenv("ANTIGRAVITY_CONVERSATION_ID", test_conv_id)
+
+        try:
+            r = asyncio.run(tools.session_start())
+            # End session - should trigger transcript sync
+            asyncio.run(tools.session_end(r.session_id))
+
+            # Verify database messages are synchronized
+            msgs = tools.db.get_session_messages(r.session_id)
+            assert len(msgs) == 2
+            assert msgs[0].role == "user"
+            assert msgs[0].content == "Hola Lucy."
+            assert msgs[1].role == "assistant"
+            assert msgs[1].content == "¡Hola, Víctor! ¿Cómo estás?"
+        finally:
+            if log_dir.parent.parent.exists():
+                shutil.rmtree(log_dir.parent.parent)
+
+    def test_session_end_with_transcript_sync_client_mismatch(self, tools, monkeypatch):
+        from pathlib import Path
+        import shutil
+        import json
+
+        test_conv_id = "test-conv-sync-456"
+        log_dir = Path.home() / ".gemini" / "antigravity-cli" / "brain" / test_conv_id / ".system_generated" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        transcript_file = log_dir / "transcript_full.jsonl"
+
+        lines = [
+            {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "hello"}
+        ]
+        with open(transcript_file, "w", encoding="utf-8") as f:
+            for line in lines:
+                f.write(json.dumps(line) + "\n")
+
+        monkeypatch.setenv("ANTIGRAVITY_CONVERSATION_ID", test_conv_id)
+
+        try:
+            r = asyncio.run(tools.session_start())
+            # End session with mismatched client
+            asyncio.run(tools.session_end(r.session_id, client="other_cli"))
+
+            # Verify database messages are NOT synchronized
+            msgs = tools.db.get_session_messages(r.session_id)
+            assert len(msgs) == 0
+        finally:
+            if log_dir.parent.parent.exists():
+                shutil.rmtree(log_dir.parent.parent)
+
+    def test_session_end_with_grok_transcript_sync(self, tools, monkeypatch):
+        from pathlib import Path
+        import shutil
+        import json
+        from urllib.parse import quote
+
+        test_conv_id = "test-grok-sync-789"
+        cwd = "/tmp/alambique-grok-test"
+        encoded_cwd = quote(cwd, safe="")
+        session_dir = Path.home() / ".grok" / "sessions" / encoded_cwd / test_conv_id
+        transcript_file = session_dir / "chat_history.jsonl"
+
+        lines = [
+            {"type": "system", "content": "bootstrap"},
+            {
+                "type": "user",
+                "content": [{"type": "text", "text": "<user_info>meta</user_info>"}],
+            },
+            {
+                "type": "user",
+                "content": [{"type": "text", "text": "<user_query>\nHola Lucy.\n</user_query>"}],
+            },
+            {
+                "type": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-1", "name": "Read", "arguments": "{}"}],
+            },
+            {"type": "tool_result", "tool_call_id": "call-1", "content": "ok"},
+            {"type": "assistant", "content": "¡Hola, Víctor! ¿Cómo estás?"},
+        ]
+        session_dir.mkdir(parents=True, exist_ok=True)
+        with open(transcript_file, "w", encoding="utf-8") as f:
+            for line in lines:
+                f.write(json.dumps(line) + "\n")
+
+        try:
+            r = asyncio.run(tools.session_start())
+            asyncio.run(
+                tools.session_end(
+                    r.session_id,
+                    conversation_id=test_conv_id,
+                    client="grok",
+                )
+            )
+
+            msgs = tools.db.get_session_messages(r.session_id)
+            assert len(msgs) == 2
+            assert msgs[0].role == "user"
+            assert msgs[0].content == "Hola Lucy."
+            assert msgs[1].role == "assistant"
+            assert msgs[1].content == "¡Hola, Víctor! ¿Cómo estás?"
+        finally:
+            group_dir = session_dir.parent
+            if group_dir.exists():
+                shutil.rmtree(group_dir)
+
+    def test_session_end_with_grok_transcript_sync_env_fallback(self, tools, monkeypatch):
+        from pathlib import Path
+        import shutil
+        import json
+        from urllib.parse import quote
+
+        test_conv_id = "test-grok-sync-env-001"
+        cwd = "/tmp/alambique-grok-env-test"
+        encoded_cwd = quote(cwd, safe="")
+        session_dir = Path.home() / ".grok" / "sessions" / encoded_cwd / test_conv_id
+        transcript_file = session_dir / "chat_history.jsonl"
+
+        session_dir.mkdir(parents=True, exist_ok=True)
+        with open(transcript_file, "w", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "type": "user",
+                        "content": [{"type": "text", "text": "<user_query>\nPing\n</user_query>"}],
+                    }
+                )
+                + "\n"
+            )
+            f.write(json.dumps({"type": "assistant", "content": "Pong"}) + "\n")
+
+        monkeypatch.setenv("GROK_SESSION_ID", test_conv_id)
+
+        try:
+            r = asyncio.run(tools.session_start())
+            asyncio.run(tools.session_end(r.session_id, client="grok"))
+
+            msgs = tools.db.get_session_messages(r.session_id)
+            assert len(msgs) == 2
+            assert msgs[0].content == "Ping"
+            assert msgs[1].content == "Pong"
+        finally:
+            group_dir = session_dir.parent
+            if group_dir.exists():
+                shutil.rmtree(group_dir)
 
 
 # ── memory_recall ────────────────────────────────────────────────
@@ -491,8 +744,8 @@ class TestMemoryRecall:
 class TestMemorySearch:
     def test_search_finds_content(self, tools):
         r = asyncio.run(tools.session_start())
-        asyncio.run(tools.message_append(r.session_id, "user", "palabra_clave"))
-        asyncio.run(tools.message_append(r.session_id, "assistant", "respuesta"))
+        append_msg(tools, r.session_id, "user", "palabra_clave")
+        append_msg(tools, r.session_id, "assistant", "respuesta")
 
         result = asyncio.run(tools.memory_search("palabra_clave"))
         assert "results" in result
@@ -521,9 +774,9 @@ class TestMemoryContext:
 
     def test_context_with_messages(self, tools):
         r = asyncio.run(tools.session_start())
-        asyncio.run(tools.message_append(r.session_id, "user", "msg1"))
-        asyncio.run(tools.message_append(r.session_id, "assistant", "msg2"))
-        asyncio.run(tools.message_append(r.session_id, "user", "msg3"))
+        append_msg(tools, r.session_id, "user", "msg1")
+        append_msg(tools, r.session_id, "assistant", "msg2")
+        append_msg(tools, r.session_id, "user", "msg3")
 
         result = asyncio.run(tools.memory_context(r.session_id))
         assert result.total == 3
@@ -534,7 +787,7 @@ class TestMemoryContext:
     def test_context_offset(self, tools):
         r = asyncio.run(tools.session_start())
         for i in range(5):
-            asyncio.run(tools.message_append(r.session_id, "user", f"msg{i}"))
+            append_msg(tools, r.session_id, "user", f"msg{i}")
 
         result = asyncio.run(tools.memory_context(r.session_id, offset=2, limit=2))
         assert result.total == 5
@@ -549,7 +802,7 @@ class TestMemoryContext:
 
     def test_context_includes_session_summary(self, tools):
         r = asyncio.run(tools.session_start())
-        asyncio.run(tools.message_append(r.session_id, "user", "hi"))
+        append_msg(tools, r.session_id, "user", "hi")
         tools.db.close_session(r.session_id)
         tools.db.set_session_summary(r.session_id, "Charla de prueba")
 
@@ -608,7 +861,7 @@ class TestMemoryExport:
         from alambique.tools import _insert_embedding
 
         r = asyncio.run(tools.session_start())
-        asyncio.run(tools.message_append(r.session_id, "user", "hi"))
+        append_msg(tools, r.session_id, "user", "hi")
         f = Fact(key="nombre",
             value="Víctor",
             category=FactCategory.PERSONAL,
@@ -1058,18 +1311,7 @@ class TestDbGuard:
 
         assert order.index("end-a") < order.index("start-b") or order.index("end-b") < order.index("start-a")
 
-    def test_concurrent_message_appends(self, tools):
-        async def run() -> None:
-            r = await tools.session_start()
-            await asyncio.gather(
-                *[
-                    tools.message_append(r.session_id, "user", f"msg-{i}")
-                    for i in range(25)
-                ]
-            )
-            assert tools.db.session_message_count(r.session_id) == 25
 
-        asyncio.run(run())
 
 
 class TestBackgroundTasks:
@@ -1084,6 +1326,93 @@ class TestBackgroundTasks:
         asyncio.run(tools.session_start())
         stale = tools.db.find_stale_sessions(timeout_minutes=-1)
         assert len(stale) >= 1
+
+    def test_watchdog_syncs_bound_grok_transcript(self, tools, mock_ollama):
+        from pathlib import Path
+        import shutil
+        import json
+        from urllib.parse import quote
+
+        test_conv_id = "test-grok-watchdog-001"
+        workspace = "/tmp/alambique-grok-watchdog"
+        encoded_cwd = quote(workspace, safe="")
+        session_dir = Path.home() / ".grok" / "sessions" / encoded_cwd / test_conv_id
+        transcript_file = session_dir / "chat_history.jsonl"
+
+        lines = [
+            {
+                "type": "user",
+                "content": [{"type": "text", "text": "<user_query>\nSin end manual\n</user_query>"}],
+            },
+            {"type": "assistant", "content": "Consolidación automática"},
+        ]
+        session_dir.mkdir(parents=True, exist_ok=True)
+        with open(transcript_file, "w", encoding="utf-8") as f:
+            for line in lines:
+                f.write(json.dumps(line) + "\n")
+
+        active_path = Path.home() / ".grok" / "active_sessions.json"
+        backup = active_path.read_text(encoding="utf-8") if active_path.exists() else None
+        active_path.parent.mkdir(parents=True, exist_ok=True)
+        active_path.write_text(
+            json.dumps(
+                [{"session_id": test_conv_id, "pid": 1, "cwd": workspace, "opened_at": "now"}]
+            ),
+            encoding="utf-8",
+        )
+
+        try:
+            started = asyncio.run(
+                tools.session_start(client="grok", workspace=workspace)
+            )
+            tools.db.conn.execute(
+                "UPDATE sessions SET created_at = datetime('now', '-31 minutes') WHERE id = ?",
+                (started.session_id,),
+            )
+            tools.db.conn.commit()
+
+            stale = tools.db.find_stale_sessions(timeout_minutes=30)
+            assert any(s.id == started.session_id for s in stale)
+
+            bound = tools.db.get_session(started.session_id)
+            asyncio.run(
+                tools._close_session(
+                    bound.id,
+                    SessionStatus.TRUNCATED,
+                    conversation_id=bound.conversation_id,
+                    client=bound.client,
+                )
+            )
+
+            closed = tools.db.get_session(started.session_id)
+            msgs = tools.db.get_session_messages(started.session_id)
+            assert closed.status == SessionStatus.TRUNCATED
+            assert len(msgs) == 2
+            assert msgs[0].content == "Sin end manual"
+            assert msgs[1].content == "Consolidación automática"
+        finally:
+            if backup is None:
+                active_path.unlink(missing_ok=True)
+            else:
+                active_path.write_text(backup, encoding="utf-8")
+            group_dir = session_dir.parent
+            if group_dir.exists():
+                shutil.rmtree(group_dir)
+
+    def test_watchdog_without_binding_leaves_session_empty(self, tools, mock_ollama):
+        started = asyncio.run(tools.session_start())
+        tools.db.conn.execute(
+            "UPDATE sessions SET created_at = datetime('now', '-31 minutes') WHERE id = ?",
+            (started.session_id,),
+        )
+        tools.db.conn.commit()
+
+        asyncio.run(
+            tools._close_session(started.session_id, SessionStatus.TRUNCATED)
+        )
+
+        msgs = tools.db.get_session_messages(started.session_id)
+        assert msgs == []
 
     def test_online_property_false_without_key(self, tools):
         assert tools.online is False
@@ -1138,9 +1467,9 @@ class TestSessionLifecycle:
         r = asyncio.run(tools.session_start())
         assert tools.db.get_session(r.session_id).status == SessionStatus.OPEN
 
-        asyncio.run(tools.message_append(r.session_id, "user", "Hola"))
-        asyncio.run(tools.message_append(r.session_id, "assistant", "Respuesta"))
-        asyncio.run(tools.message_append(r.session_id, "user", "Gracias"))
+        append_msg(tools, r.session_id, "user", "Hola")
+        append_msg(tools, r.session_id, "assistant", "Respuesta")
+        append_msg(tools, r.session_id, "user", "Gracias")
 
         msgs = tools.db.get_session_messages(r.session_id)
         assert len(msgs) == 3
