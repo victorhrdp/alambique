@@ -341,6 +341,59 @@ class TestSessionStartBinding:
             if group_dir.exists():
                 shutil.rmtree(group_dir)
 
+    def test_session_start_binds_antigravity_conversation(self, tools, monkeypatch, tmp_path):
+        import json
+        import shutil
+
+        test_conv_id = "test-antigravity-bind-001"
+        workspace = "/tmp/alambique-antigravity-bind"
+        agy_home = tmp_path / "antigravity-cli"
+        brain = agy_home / "brain" / test_conv_id
+        logs = brain / ".system_generated" / "logs"
+        logs.mkdir(parents=True)
+        (logs / "transcript_full.jsonl").write_text(
+            json.dumps(
+                {
+                    "type": "PLANNER_RESPONSE",
+                    "source": "MODEL",
+                    "content": "hola",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        history = agy_home / "history.jsonl"
+        history.write_text(
+            json.dumps(
+                {
+                    "display": "ping",
+                    "timestamp": 99,
+                    "workspace": workspace,
+                    "conversationId": test_conv_id,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(
+            "alambique.transcripts.antigravity_cli.ANTIGRAVITY_HOME",
+            agy_home,
+        )
+
+        try:
+            result = asyncio.run(
+                tools.session_start(client="antigravity_cli", workspace=workspace)
+            )
+            stored = tools.db.get_session(result.session_id)
+            assert stored.client == "antigravity_cli"
+            assert stored.conversation_id == test_conv_id
+            assert result.conversation_id == test_conv_id
+        finally:
+            if brain.parent.exists():
+                shutil.rmtree(brain.parent)
+
     def test_session_end_uses_stored_binding(self, tools, monkeypatch):
         from pathlib import Path
         import shutil
@@ -439,21 +492,42 @@ class TestSessionEnd:
             for line in lines:
                 f.write(json.dumps(line) + "\n")
 
-        monkeypatch.setenv("ANTIGRAVITY_CONVERSATION_ID", test_conv_id)
+        history_path = Path.home() / ".gemini" / "antigravity-cli" / "history.jsonl"
+        history_backup = history_path.read_text(encoding="utf-8") if history_path.exists() else None
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        history_path.write_text(
+            json.dumps(
+                {
+                    "display": "sync test",
+                    "timestamp": 1,
+                    "workspace": "/tmp/alambique-antigravity-sync",
+                    "conversationId": test_conv_id,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
 
         try:
-            r = asyncio.run(tools.session_start())
-            # End session - should trigger transcript sync
+            r = asyncio.run(
+                tools.session_start(
+                    client="antigravity_cli",
+                    workspace="/tmp/alambique-antigravity-sync",
+                )
+            )
             asyncio.run(tools.session_end(r.session_id))
 
-            # Verify database messages are synchronized
             msgs = tools.db.get_session_messages(r.session_id)
-            assert len(msgs) == 2
+            assert len(msgs) == 3
             assert msgs[0].role == "user"
             assert msgs[0].content == "Hola Lucy."
-            assert msgs[1].role == "assistant"
-            assert msgs[1].content == "¡Hola, Víctor! ¿Cómo estás?"
+            assert msgs[1].content == "Checking status"
+            assert msgs[2].content == "¡Hola, Víctor! ¿Cómo estás?"
         finally:
+            if history_backup is None:
+                history_path.unlink(missing_ok=True)
+            else:
+                history_path.write_text(history_backup, encoding="utf-8")
             if log_dir.parent.parent.exists():
                 shutil.rmtree(log_dir.parent.parent)
 

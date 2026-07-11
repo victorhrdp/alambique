@@ -576,9 +576,20 @@ class ToolHandler:
             return client, resolved, warnings
 
         if client == "antigravity_cli":
-            resolved = conversation_id or os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
+            from alambique.transcripts.antigravity_cli import (
+                resolve_antigravity_conversation_id,
+            )
+            from alambique.transcripts.grok_cli import normalize_workspace as normalize_ws
+
+            workspace = normalize_ws(workspace)
+            if not workspace and not conversation_id:
+                warnings.append("binding_missing_workspace")
+            resolved, resolve_warnings = resolve_antigravity_conversation_id(
+                conversation_id=conversation_id,
+                workspace=workspace,
+            )
+            warnings.extend(resolve_warnings)
             if not resolved:
-                warnings.append("antigravity_conversation_missing")
                 warnings.append("binding_failed")
             return client, resolved, warnings
 

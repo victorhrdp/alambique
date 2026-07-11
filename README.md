@@ -1,6 +1,6 @@
 # Alambique — Memoria para Lucy
 
-Memoria semántica y episódica para el asistente virtual **Lucy** (v0.2.0 — integración Grok CLI). Destila conversaciones en hechos atómicos y mantiene la continuidad de su personalidad usando LLMs y búsqueda vectorial local.
+Memoria semántica y episódica para el asistente virtual **Lucy** (v0.2.1 — Grok + Antigravity CLI). Destila conversaciones en hechos atómicos y mantiene la continuidad de su personalidad usando LLMs y búsqueda vectorial local.
 
 ## Arquitectura
 
@@ -78,6 +78,16 @@ flowchart LR
 
 **Red de seguridad** — watchdog (30 min inactividad) y shutdown del daemon sincronizan y cierran sesiones abiertas con binding.
 
+### Antigravity CLI
+
+Transcript en `~/.gemini/antigravity-cli/brain/<conversation-id>/.system_generated/logs/transcript_full.jsonl`.
+
+1. **`session_start`** — `client="antigravity_cli"`, `workspace=<cwd absoluto>`. Resuelve `conversation_id` vía `history.jsonl` (última entrada del workspace por `timestamp`).
+2. **Conversación** — Antigravity escribe el transcript en disco.
+3. **`session_end`** — solo `session_id` de Alambique.
+
+MCP en `~/.gemini/antigravity-cli/mcp_config.json` → `http://localhost:9042/sse`.
+
 ### Respuestas clave
 
 | Tool | Campos útiles |
@@ -116,7 +126,7 @@ flowchart LR
 
 ## Pruebas
 
-**267** pruebas unitarias (DB, Ollama, consolidación, Grok CLI, herramientas MCP).
+**272** pruebas unitarias (DB, Ollama, consolidación, Grok CLI, herramientas MCP).
 
 ```bash
 .venv/bin/pytest -v

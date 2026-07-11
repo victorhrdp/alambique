@@ -62,7 +62,8 @@ TOOL_DEFINITIONS = [
         name="session_start",
         description=(
             "Inicia una sesión de memoria de Lucy. Llámala al inicio de cada conversación. "
-            "En Grok, pasa client='grok' y workspace=<cwd> para enlazar el transcript."
+            "En Grok: client='grok' y workspace=<cwd>. "
+            "En Antigravity CLI: client='antigravity_cli' y workspace=<cwd>."
         ),
         inputSchema={
             "type": "object",
