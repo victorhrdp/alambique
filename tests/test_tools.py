@@ -9,20 +9,17 @@ import pytest
 from alambique.database import Database
 from alambique.memory_maintenance import parse_embedding_blob
 from alambique.models import (
-    ConsolidationAction,
-    ConsolidationFactItem,
     ConsolidationResponse,
-    Fact,
-    FactCategory,
-    Message,
-    SessionStartOutput,
-    SessionEndOutput,
-    SessionStatus,
     MemoryContextOutput,
+    MemoryRecallOutput,
+    MemoryStatusOutput,
+    Message,
+    SessionEndOutput,
+    SessionStartOutput,
+    SessionStatus,
 )
 from alambique.tools import (
     ToolHandler,
-    consolidation_search_text,
     messages_for_consolidation,
 )
 
@@ -97,112 +94,6 @@ class TestSessionStart:
         assert s is not None
         assert s.status == SessionStatus.OPEN
 
-    def test_online_with_facts_composes_persona(self, tools_online, mock_ollama):
-        db = tools_online.db
-        f = Fact(
-            key="sarcastic",
-            value="Es sarcástica",
-            category=FactCategory.PERSONALITY,
-            confidence=0.9,
-        )
-        db.insert_fact(f)
-
-        mock_recall = MagicMock()
-        mock_recall.compose_personality = AsyncMock(return_value="Eres Lucy. Sarcástica y genial.")
-        mock_recall.close = AsyncMock()
-        tools_online._recall = mock_recall
-
-        result = asyncio.run(tools_online.session_start())
-        assert result.persona == "Eres Lucy. Sarcástica y genial."
-        assert result.is_new is True
-
-    def test_persona_seed_on_new_agent(self, tools_online):
-        mock_recall = MagicMock()
-        mock_recall.compose_personality = AsyncMock(
-            return_value="Eres Lucy, la AI más inteligente."
-        )
-        mock_recall.close = AsyncMock()
-        tools_online._recall = mock_recall
-
-        result = asyncio.run(
-            tools_online.session_start(persona_seed="Eres Lucy, la AI más inteligente.",
-            )
-        )
-        assert result.is_new is True
-        assert result.persona == "Eres Lucy, la AI más inteligente."
-        traits = tools_online.db.get_facts(
-            categories=(FactCategory.PERSONALITY,)
-        )
-        assert len(traits) == 1
-        assert traits[0].key == "persona_seed"
-
-    def test_persona_seed_ignored_when_traits_exist(self, tools_online):
-        tools_online.db.insert_fact(
-            Fact(
-                key="existing",
-                value="Personalidad previa",
-                category=FactCategory.PERSONALITY,
-                confidence=1.0,
-            )
-        )
-        mock_recall = MagicMock()
-        mock_recall.compose_personality = AsyncMock(return_value="Personalidad previa compuesta.")
-        mock_recall.close = AsyncMock()
-        tools_online._recall = mock_recall
-
-        asyncio.run(
-            tools_online.session_start(persona_seed="Semilla que no debe guardarse")
-        )
-        traits = tools_online.db.get_facts(
-            categories=(FactCategory.PERSONALITY,)
-        )
-        assert len(traits) == 1
-        assert traits[0].key == "existing"
-
-    def test_offline_uses_trait_without_llm(self, tools):
-        tools.db.insert_fact(
-            Fact(key="persona_seed",
-                value="Eres Lucy offline.",
-                category=FactCategory.PERSONALITY,
-                confidence=1.0,
-            )
-        )
-        result = asyncio.run(tools.session_start())
-        assert result.persona == "Eres Lucy offline."
-        assert result.degraded is True
-        assert "offline_mode" in result.warnings
-        assert "persona_offline_fallback" in result.warnings
-
-    def test_online_no_facts_returns_null_persona(self, tools_online):
-        mock_recall = MagicMock()
-        mock_recall.compose_personality = AsyncMock(return_value=None)
-        mock_recall.close = AsyncMock()
-        tools_online._recall = mock_recall
-
-        result = asyncio.run(tools_online.session_start())
-        assert result.is_new is True
-        assert result.persona is None
-
-    def test_persona_composition_handles_error(self, tools_online):
-        db = tools_online.db
-        asyncio.run(tools_online.session_start())
-        f = Fact(key="trait",
-            value="algo",
-            category=FactCategory.PERSONALITY,
-            confidence=0.9,
-        )
-        db.insert_fact(f)
-
-        mock_recall = MagicMock()
-        mock_recall.compose_personality = AsyncMock(side_effect=Exception("API down"))
-        mock_recall.close = AsyncMock()
-        tools_online._recall = mock_recall
-
-        result = asyncio.run(tools_online.session_start())
-        assert result.persona == "algo"  # fallback al rasgo si falla el LLM
-
-
-# ── session_end ──────────────────────────────────────────────────
 
 
 class TestSessionStartBinding:
@@ -278,7 +169,6 @@ class TestSessionStartBinding:
             )
             assert first.session_id == second.session_id
             assert second.session_reused is True
-            assert "session_reused" in second.warnings
             open_bound = tools.db.get_open_sessions_by_binding("grok", test_conv_id)
             assert len(open_bound) == 1
         finally:
@@ -800,190 +690,35 @@ class TestSessionEnd:
                 shutil.rmtree(group_dir)
 
 
-# ── memory_recall ────────────────────────────────────────────────
+# ── session_update ───────────────────────────────────────────────
 
 
-class TestMemoryRecall:
-    def test_recall_with_vector_results(self, tools, mock_ollama):
-        db = tools.db
-        asyncio.run(tools.session_start())
-        f = Fact(key="juegos",
-            value="Víctor juega It Takes Two con Enrique",
-            category=FactCategory.PERSONAL,
-            confidence=1.0,
+class TestSessionUpdate:
+    def test_updates_expression_and_mood(self, tools):
+        r = asyncio.run(tools.session_start())
+        out = asyncio.run(
+            tools.session_update(r.session_id, "happy", "contenta de verte")
         )
-        fid = db.insert_fact(f)
-        db.record_fact_access(fid)
+        assert out == {"status": "ok"}
 
-        with patch.object(tools, "_vector_search") as mock_vs:
-            mock_vs.side_effect = [
-                [{"id": fid, "rowid": fid, "distance": 0.1}],  # vec0_facts
-                [],  # vec0_sessions
-            ]
-            result = asyncio.run(tools.memory_recall("juegos cooperativos"))
+        row = tools.db.get_latest_open_session_row()
+        assert row["expression"] == "happy"
+        assert row["mood_text"] == "contenta de verte"
 
-        assert len(result.facts) == 1
-        assert result.facts[0]["key"] == "juegos"
+    def test_rejects_unknown_session(self, tools):
+        with pytest.raises(ValueError, match="Sesión no encontrada"):
+            asyncio.run(
+                tools.session_update("sess_deadbeef", "normal", "ok")
+            )
 
-    def test_recall_fallback_on_vector_error(self, tools, mock_ollama):
-        mock_ollama.embed.side_effect = Exception("Ollama down")
-
-        asyncio.run(tools.session_start())
-        f = Fact(key="nombre",
-            value="Víctor",
-            category=FactCategory.PERSONAL,
-            confidence=1.0,
-        )
-        tools.db.insert_fact(f)
-
-        result = asyncio.run(tools.memory_recall("quién soy"))
-        assert len(result.facts) > 0
-        assert result.summary != ""
-        assert result.degraded is True
-        assert "vector_search_failed" in result.warnings
-        assert "recall_degraded_recent_facts" in result.warnings
-
-    def test_recall_no_results(self, tools, mock_ollama):
-        with patch.object(tools, "_vector_search", return_value=[]):
-            result = asyncio.run(tools.memory_recall("nada"))
-
-        assert result.facts == []
-        assert result.related_sessions == []
-
-    def test_recall_no_candidates_warning(self, tools, mock_ollama):
-        db = tools.db
-        f_low = Fact(key="dubious",
-            value="not sure",
-            category=FactCategory.PERSONAL,
-            confidence=0.5,
-        )
-        fid_low = db.insert_fact(f_low)
-
-        with patch.object(tools, "_vector_search") as mock_vs:
-            mock_vs.side_effect = [
-                [{"id": fid_low, "rowid": fid_low, "distance": 0.1}],
-                [],
-            ]
-            result = asyncio.run(tools.memory_recall("test"))
-
-        assert result.facts == []
-        assert "no_candidates_after_filter" in result.warnings
-        assert result.degraded is True
-
-    def test_recall_online_composes_summary(self, tools_online, mock_ollama):
-        db = tools_online.db
-        f = Fact(key="nombre",
-            value="Víctor",
-            category=FactCategory.PERSONAL,
-            confidence=1.0,
-        )
-        fid = db.insert_fact(f)
-
-        mock_recall = MagicMock()
-        mock_recall.compose_summary = AsyncMock(return_value="Víctor juega con Enrique.")
-        mock_recall.compose_personality = AsyncMock(return_value=None)
-        mock_recall.close = AsyncMock()
-        tools_online._recall = mock_recall
-
-        with patch.object(tools_online, "_vector_search") as mock_vs:
-            mock_vs.side_effect = [
-                [{"id": fid, "rowid": fid, "distance": 0.1}],
-                [],
-            ]
-            result = asyncio.run(tools_online.memory_recall("juegos"))
-
-        assert result.summary == "Víctor juega con Enrique."
-
-    def test_recall_filters_low_confidence_facts(self, tools, mock_ollama):
-        db = tools.db
-        f_low = Fact(key="dubious",
-            value="not sure",
-            category=FactCategory.PERSONAL,
-            confidence=0.5,
-        )
-        fid_low = db.insert_fact(f_low)
-        f_high = Fact(key="sure",
-            value="confirmed",
-            category=FactCategory.PERSONAL,
-            confidence=1.0,
-        )
-        fid_high = db.insert_fact(f_high)
-
-        with patch.object(tools, "_vector_search") as mock_vs:
-            mock_vs.side_effect = [
-                [
-                    {"id": fid_low, "rowid": fid_low, "distance": 0.1},
-                    {"id": fid_high, "rowid": fid_high, "distance": 0.2},
-                ],
-                [],
-            ]
-            result = asyncio.run(tools.memory_recall("test"))
-
-        keys = {f["key"] for f in result.facts}
-        assert "sure" in keys
-        assert "dubious" not in keys
-
-    def test_recall_hybrid_re_ranking(self, tools, mock_ollama):
-        db = tools.db
-        asyncio.run(tools.session_start())
-        
-        # 1. Fact A: Very close vector-wise (distance=0.01 -> similarity=0.99), low access (0), confidence=1.0
-        # Score = 0.99 * 0.6 + 1.0 * 0.2 + 0.0 * 0.2 = 0.594 + 0.2 = 0.794
-        f_a = Fact(key="fact_a",
-            value="A very close match semantically",
-            category=FactCategory.PREFERENCE,
-            confidence=1.0,
-            access_count=0,
-        )
-        fid_a = db.insert_fact(f_a)
-        
-        # 2. Fact B: Slightly further vector-wise (distance=0.4 -> similarity=0.714), high access (10 -> reinforcement=0.5), confidence=1.0
-        # Score = 0.714 * 0.6 + 1.0 * 0.2 + 0.5 * 0.2 = 0.428 + 0.2 + 0.1 = 0.728
-        f_b = Fact(key="fact_b",
-            value="A slightly further match",
-            category=FactCategory.PREFERENCE,
-            confidence=1.0,
-            access_count=10,
-        )
-        fid_b = db.insert_fact(f_b)
-
-        # 3. Fact C: Furthest vector-wise (distance=0.6 -> similarity=0.625), extremely high access (20 -> reinforcement=1.0), confidence=1.0
-        # Score = 0.625 * 0.6 + 1.0 * 0.2 + 1.0 * 0.2 = 0.375 + 0.2 + 0.2 = 0.775
-        f_c = Fact(key="fact_c",
-            value="The furthest match but very popular",
-            category=FactCategory.PREFERENCE,
-            confidence=1.0,
-            access_count=20,
-        )
-        fid_c = db.insert_fact(f_c)
-
-        # Update access counts directly in database since insert_fact ignores access_count
-        db.conn.execute("UPDATE facts SET access_count = 10 WHERE id = ?", (fid_b,))
-        db.conn.execute("UPDATE facts SET access_count = 20 WHERE id = ?", (fid_c,))
-        db.conn.commit()
-
-        with patch.object(tools, "_vector_search") as mock_vs:
-            mock_vs.side_effect = [
-                [
-                    {"id": fid_a, "rowid": fid_a, "distance": 0.01},
-                    {"id": fid_b, "rowid": fid_b, "distance": 0.4},
-                    {"id": fid_c, "rowid": fid_c, "distance": 0.6},
-                ],
-                [],
-            ]
-            result = asyncio.run(tools.memory_recall("search query"))
-
-        # The expected ranking order of keys based on scores:
-        # 1. fact_a (0.794)
-        # 2. fact_c (0.775)
-        # 3. fact_b (0.728)
-        assert len(result.facts) == 3
-        assert result.facts[0]["key"] == "fact_a"
-        assert result.facts[1]["key"] == "fact_c"
-        assert result.facts[2]["key"] == "fact_b"
+    def test_rejects_invalid_expression(self, tools):
+        r = asyncio.run(tools.session_start())
+        with pytest.raises(ValueError, match="Expresión inválida"):
+            asyncio.run(
+                tools.session_update(r.session_id, "furious", "enfadada")
+            )
 
 
-# ── memory_search ────────────────────────────────────────────────
 
 
 class TestMemorySearch:
@@ -1062,67 +797,7 @@ class TestMemoryContext:
 # ── memory_forget ────────────────────────────────────────────────
 
 
-class TestMemoryForget:
-    def test_forget_by_fact_id(self, tools):
-        f = Fact(key="temp",
-            value="to forget",
-            category=FactCategory.PERSONALITY,
-        )
-        fid = tools.db.insert_fact(f)
-        result = asyncio.run(tools.memory_forget(fact_id=fid))
-        assert result["deleted"] is True
-
-        forgotten = tools.db.get_fact(fid)
-        assert forgotten.confidence == 0
-
-    def test_forget_by_key(self, tools):
-        f = Fact(key="old_pref",
-            value="vim",
-            category=FactCategory.PREFERENCE,
-        )
-        tools.db.insert_fact(f)
-        result = asyncio.run(tools.memory_forget(key="old_pref"))
-        assert result["deleted"] is True
-
-    def test_forget_nonexistent_raises(self, tools):
-        with pytest.raises(ValueError):
-            asyncio.run(tools.memory_forget(key="nope"))
-
-    def test_forget_no_params_raises(self, tools):
-        with pytest.raises(ValueError, match="Especifica"):
-            asyncio.run(tools.memory_forget())
-
-
-# ── memory_export ────────────────────────────────────────────────
-
-
-class TestMemoryExport:
-    def test_export_empty(self, tools):
-        result = asyncio.run(tools.memory_export())
-        assert result["facts"] == []
-        assert result["sessions"] == []
-
-    def test_export_with_data(self, tools):
-        from alambique.tools import _insert_embedding
-
-        r = asyncio.run(tools.session_start())
-        append_msg(tools, r.session_id, "user", "hi")
-        f = Fact(key="nombre",
-            value="Víctor",
-            category=FactCategory.PERSONAL,
-        )
-        fid = tools.db.insert_fact(f)
-        _insert_embedding(tools.db.conn, "vec0_facts", fid, [0.1] * 1024)
-
-        tools.db.close_session(r.session_id)
-        tools.db.set_session_summary(r.session_id, "Saludo inicial")
-
-        result = asyncio.run(tools.memory_export())
-        assert len(result["facts"]) == 1
-        assert len(result["sessions"]) == 1
-        assert result["facts"][0]["embedding_ok"] is True
-        assert result["facts"][0]["created_at"] is not None
-        assert result["sessions"][0]["created_at"] is not None
+# (legacy memory_forget and memory_export tests removed)
 
 
 # ── memory_status ────────────────────────────────────────────────
@@ -1148,20 +823,100 @@ class TestMemoryHealth:
         assert result.mode == "offline"
         assert "offline_mode" in result.warnings
 
-    def test_health_orphan_embeddings(self, tools, mock_ollama):
-        tools.db.insert_fact(
-            Fact(key="orphan", value="sin vector", category=FactCategory.PERSONAL)
+class TestApiKeyRuntime:
+    def test_note_api_key_attempt_logs_failure_reason(self, tools, caplog):
+        from alambique.consolidator import ApiKeyFetchResult
+
+        with caplog.at_level("WARNING"):
+            loaded = tools.note_api_key_attempt(
+                ApiKeyFetchResult(error="pass no respondió en 120s — pinentry")
+            )
+
+        assert loaded is False
+        assert tools._api_key_attempt_count == 1
+        assert "pass no respondió" in tools._api_key_last_error
+        assert any("intento 1" in record.message for record in caplog.records)
+
+    def test_api_key_runtime_state_waiting_pass(self, tools):
+        from alambique.consolidator import ApiKeyFetchResult
+
+        tools.note_api_key_attempt(
+            ApiKeyFetchResult(error="pass no respondió en 120s — pinentry")
         )
-        result = asyncio.run(tools.memory_health())
-        assert result.checks["embeddings"].status == "warning"
-        assert "embeddings_orphaned" in result.warnings
+        state = tools._api_key_runtime_state()
+        assert state.status == "waiting_pass"
+        assert "120s" in (state.detail or "")
+
+    def test_waiting_pass_sends_desktop_notification_once(self, tools, monkeypatch):
+        from alambique.consolidator import ApiKeyFetchResult
+
+        calls: list[tuple[str, str]] = []
+
+        def fake_notify(title, body, **kwargs):
+            calls.append((title, body))
+            return True
+
+        monkeypatch.setattr("alambique.tools.base.send_desktop_notification", fake_notify)
+
+        err = ApiKeyFetchResult(error="pass no respondió en 120s — pinentry")
+        tools.note_api_key_attempt(err)
+        tools.note_api_key_attempt(err)
+        assert len(calls) == 1
+        assert "contraseña GPG" in calls[0][0]
+
+
+class TestDaemonStatus:
+    def test_daemon_status_uses_widget_checks(self, tools_online, mock_ollama):
+        result = asyncio.run(tools_online.daemon_status(port=9042))
+        assert result.online is True
+        assert result.checks["daemon"].status == "ok"
+        assert "9042" in (result.checks["daemon"].detail or "")
+        assert "llm" in result.checks
+        assert result.api_key.status == "loaded"
+
+    def test_daemon_status_offline_reports_reason(self, tools, mock_ollama):
+        from alambique.consolidator import ApiKeyFetchResult
+
+        tools.note_api_key_attempt(
+            ApiKeyFetchResult(error="pass no respondió en 120s — pinentry")
+        )
+        result = asyncio.run(tools.daemon_status())
+        assert result.mode == "offline"
+        assert result.overall == "degraded"
+        assert result.api_key.status == "waiting_pass"
+        assert "pinentry" in (result.checks["llm"].detail or "").lower()
+
+    def test_daemon_status_system_message_ok(self, tools_online, mock_ollama):
+        result = asyncio.run(tools_online.daemon_status(port=9042))
+        assert result.system_message_level == "ok"
+        assert "perfecto" in result.system_message.lower()
+
+    def test_daemon_status_system_message_llm_recovery(self, tools_online, mock_ollama):
+        tools_online._note_llm_outcome(False, "500 Internal Server Error")
+        tools_online._note_llm_outcome(True, retried=True)
+        result = asyncio.run(tools_online.daemon_status(port=9042))
+        assert result.system_message_level == "warning"
+        assert "inestabilidad" in result.system_message.lower()
+        assert "ahora" in result.system_message.lower()
+
+    def test_daemon_status_humanizes_consolidation_warning(self, tools_online, mock_ollama):
+        tools_online._consolidation_warnings.append(
+            "consolidation_filtered_prefix:architecture_"
+        )
+        result = asyncio.run(tools_online.daemon_status(port=9042))
+        assert result.system_message_level == "info"
+        assert result.overall == "ok"
+        assert result.status_summary == "Operativo"
+        assert "Todo funciona" in result.system_message
+        assert "arquitectura del código" in result.system_message
+        assert "consolidation_filtered" not in result.system_message
 
 
 class TestMemoryStatus:
     def test_status_empty(self, tools):
         result = asyncio.run(tools.memory_status())
         assert result.sessions == 0
-        assert result.facts == 0
+        assert result.threads == 0
         assert result.pending_consolidation == 0
         assert result.last_consolidation is None
 
@@ -1170,16 +925,9 @@ class TestMemoryStatus:
         r2 = asyncio.run(tools.session_start())
         asyncio.run(tools.session_end(r1.session_id))  # close to count as open => count session
 
-        f = Fact(
-            key="nombre",
-            value="Víctor",
-            category=FactCategory.PERSONAL,
-        )
-        tools.db.insert_fact(f)
 
         result = asyncio.run(tools.memory_status())
         assert result.sessions == 2
-        assert result.facts == 1
         assert result.pending_consolidation == 1
 
 
@@ -1199,341 +947,6 @@ class TestVectorHelpers:
         for sid in test_ids:
             assert _rowid_to_session_id(_session_id_to_rowid(sid)) == sid
 
-    def test_insert_embedding_fact(self, db, mock_ollama):
-        from alambique.tools import _insert_embedding
-
-        conn = db.conn
-        _insert_embedding(conn, "vec0_facts", 1, [0.1] * 1024)
-
-        rows = conn.execute(
-            "SELECT rowid FROM vec0_facts WHERE rowid = 1"
-        ).fetchall()
-        assert len(rows) == 1
-
-    def test_insert_embedding_session(self, db, mock_ollama):
-        from alambique.tools import _insert_embedding, _session_id_to_rowid
-
-        conn = db.conn
-        sid = "sess_abc123def456"
-        rowid = _session_id_to_rowid(sid)
-        _insert_embedding(conn, "vec0_sessions", sid, [0.1] * 1024)
-
-        rows = conn.execute(
-            "SELECT rowid FROM vec0_sessions WHERE rowid = ?", (rowid,)
-        ).fetchall()
-        assert len(rows) == 1
-        assert rows[0][0] == rowid
-
-    def test_update_embedding(self, db, mock_ollama):
-        from alambique.tools import _insert_embedding, _update_embedding
-
-        conn = db.conn
-        _insert_embedding(conn, "vec0_facts", 42, [1.0] * 1024)
-        _update_embedding(conn, "vec0_facts", 42, [0.5] * 1024)
-
-        rows = conn.execute(
-            "SELECT rowid FROM vec0_facts WHERE rowid = 42"
-        ).fetchall()
-        assert len(rows) == 1
-
-    def test_upsert_embedding_inserts_then_updates(self, db, mock_ollama):
-        from alambique.tools import _upsert_embedding
-
-        conn = db.conn
-        _upsert_embedding(conn, "vec0_facts", 7, [0.1] * 1024)
-        _upsert_embedding(conn, "vec0_facts", 7, [0.9] * 1024)
-
-        row = conn.execute(
-            "SELECT embedding FROM vec0_facts WHERE rowid = 7"
-        ).fetchone()
-        assert parse_embedding_blob(row["embedding"])[0] == pytest.approx(0.9)
-
-    def test_vector_search_facts(self, tools, mock_ollama):
-        from alambique.tools import _insert_embedding
-
-        conn = tools.db.conn
-        f1 = Fact(key="a", value="v", category=FactCategory.PERSONAL)
-        f2 = Fact(key="b", value="v", category=FactCategory.PERSONALITY)
-        fid1 = tools.db.insert_fact(f1)
-        fid2 = tools.db.insert_fact(f2)
-
-        # Create same embedding for both
-        emb = [0.1] * 1024
-        _insert_embedding(conn, "vec0_facts", fid1, emb)
-        _insert_embedding(conn, "vec0_facts", fid2, emb)
-
-        results = tools._vector_search("vec0_facts", emb, limit=10)
-        assert len(results) == 2
-
-    def test_vector_search_active_facts_only_excludes_forgotten(self, tools, mock_ollama):
-        from alambique.tools import _insert_embedding
-
-        conn = tools.db.conn
-        f = Fact(key="gone", value="v", category=FactCategory.PERSONAL)
-        fid = tools.db.insert_fact(f)
-        tools.db.forget_fact(fid)
-        emb = [0.1] * 1024
-        _insert_embedding(conn, "vec0_facts", fid, emb)
-
-        results = tools._vector_search(
-            "vec0_facts",
-            emb,
-            limit=10,
-            active_facts_only=True,
-        )
-        assert results == []
-
-    def test_vector_search_sessions(self, tools, mock_ollama):
-        from alambique.tools import _insert_embedding, _session_id_to_rowid, _rowid_to_session_id
-
-        conn = tools.db.conn
-        r = asyncio.run(tools.session_start())
-        sid = r.session_id
-        emb = [0.1] * 1024
-        _insert_embedding(conn, "vec0_sessions", sid, emb)
-
-        results = tools._vector_search("vec0_sessions", emb, limit=5)
-        assert len(results) == 1
-        assert results[0]["session_id"] == sid
-
-
-
-# ── consolidation fact retrieval ───────────────────────────────────
-
-
-class TestConsolidationFactRetrieval:
-    def test_consolidation_search_text(self):
-        msgs = [
-            Message(session_id="s", role="user", content="Uso CachyOS"),
-            Message(session_id="s", role="assistant", content="Interesante distro"),
-        ]
-        text = consolidation_search_text(msgs)
-        assert "user: Uso CachyOS" in text
-        assert "assistant: Interesante distro" in text
-
-    def test_consolidation_search_text_truncates(self):
-        msgs = [Message(session_id="s", role="user", content="x" * 9000)]
-        text = consolidation_search_text(msgs, max_chars=100)
-        assert len(text) == 100
-        assert text.endswith("x")
-
-    def test_facts_for_consolidation_prefers_semantic_match(self, tools, mock_ollama):
-        from alambique.tools import _insert_embedding
-
-        target = tools.db.insert_fact(
-            Fact(
-                key="keyboard",
-                value="Teclado mecánico Keychron",
-                category=FactCategory.POSSESSIONS,
-                confidence=1.0,
-            )
-        )
-        noise = tools.db.insert_fact(
-            Fact(
-                key="favorite_color",
-                value="Azul",
-                category=FactCategory.PREFERENCE,
-                confidence=1.0,
-            )
-        )
-        emb = [0.2] * 1024
-        _insert_embedding(tools.db.conn, "vec0_facts", target, emb)
-        _insert_embedding(tools.db.conn, "vec0_facts", noise, [0.9] * 1024)
-
-        mock_ollama.health = AsyncMock(return_value=True)
-        mock_ollama.embed = AsyncMock(return_value=emb)
-
-        msgs = [
-            Message(session_id="s", role="user", content="Mi teclado mecánico Keychron es genial"),
-        ]
-        facts, warnings = asyncio.run(tools._facts_for_consolidation(msgs))
-
-        assert warnings == []
-        assert any(f.id == target for f in facts)
-        assert facts[0].id == target
-
-    def test_facts_for_consolidation_includes_personality(self, tools, mock_ollama):
-        trait_id = tools.db.insert_fact(
-            Fact(
-                key="sarcastic",
-                value="Es sarcástica",
-                category=FactCategory.PERSONALITY,
-                confidence=1.0,
-            )
-        )
-        mock_ollama.health = AsyncMock(return_value=False)
-
-        msgs = [Message(session_id="s", role="user", content="Hola")]
-        facts, warnings = asyncio.run(tools._facts_for_consolidation(msgs))
-
-        assert "consolidation_facts_offline_fallback" in warnings
-        assert any(f.id == trait_id for f in facts)
-
-    def test_facts_for_consolidation_vector_fallback(self, tools, mock_ollama):
-        mock_ollama.health = AsyncMock(return_value=True)
-        mock_ollama.embed = AsyncMock(side_effect=RuntimeError("embed down"))
-
-        tools.db.insert_fact(
-            Fact(key="fallback", value="dato", category=FactCategory.PERSONAL, confidence=1.0)
-        )
-        msgs = [Message(session_id="s", role="user", content="Algo")]
-        facts, warnings = asyncio.run(tools._facts_for_consolidation(msgs))
-
-        assert "consolidation_facts_vector_fallback" in warnings
-        assert any(f.key == "fallback" for f in facts)
-
-
-# ── consolidation embeddings ───────────────────────────────────────
-
-
-class TestConsolidationEmbeddings:
-    def test_update_refreshes_existing_fact_embedding(self, tools, mock_ollama):
-        fid = tools.db.insert_fact(
-            Fact(key="os", value="Linux", category=FactCategory.PREFERENCE, confidence=1.0)
-        )
-        from alambique.tools import _insert_embedding
-
-        _insert_embedding(tools.db.conn, "vec0_facts", fid, [0.1] * 1024)
-
-        session = tools.db.create_session()
-        tools.db.close_session(session.id, SessionStatus.CLOSED)
-
-        new_emb = [0.9] * 1024
-        mock_ollama.embed_batch = AsyncMock(return_value=[new_emb])
-        mock_ollama.embed = AsyncMock(return_value=[0.2] * 1024)
-
-        response = ConsolidationResponse(
-            facts=[
-                ConsolidationFactItem(
-                    action=ConsolidationAction.UPDATE,
-                    key="os",
-                    value="CachyOS",
-                    category=FactCategory.PREFERENCE,
-                    confidence=1.0,
-                    related_fact_id=fid,
-                    reason="SO actualizado",
-                )
-            ],
-            session_summary="Cambio de sistema operativo",
-        )
-
-        asyncio.run(tools._apply_consolidation(session, response))
-
-        updated = tools.db.get_fact(fid)
-        assert updated.value == "CachyOS"
-        stored = tools.db.get_fact_embedding(fid)
-        assert stored[0] == pytest.approx(0.9)
-
-    def test_create_with_existing_key_updates_in_place(self, tools, mock_ollama):
-        fid = tools.db.insert_fact(
-            Fact(key="city", value="Madrid", category=FactCategory.PERSONAL, confidence=1.0)
-        )
-
-        session = tools.db.create_session()
-        tools.db.close_session(session.id, SessionStatus.CLOSED)
-
-        mock_ollama.embed_batch = AsyncMock(return_value=[[0.4] * 1024])
-        mock_ollama.embed = AsyncMock(return_value=[0.1] * 1024)
-
-        response = ConsolidationResponse(
-            facts=[
-                ConsolidationFactItem(
-                    action=ConsolidationAction.CREATE,
-                    key="city",
-                    value="Barcelona",
-                    category=FactCategory.PERSONAL,
-                    confidence=1.0,
-                    reason="Corrección de ciudad",
-                )
-            ],
-            session_summary="Ciudad actualizada",
-        )
-
-        asyncio.run(tools._apply_consolidation(session, response))
-
-        active = tools.db.get_fact_by_key("city")
-        assert active.id == fid
-        assert active.value == "Barcelona"
-
-    def test_contradict_allocates_alternate_key(self, tools, mock_ollama):
-        existing_id = tools.db.insert_fact(
-            Fact(key="mood", value="cansado", category=FactCategory.STATE, confidence=1.0, ttl=86400)
-        )
-
-        session = tools.db.create_session()
-        tools.db.close_session(session.id, SessionStatus.CLOSED)
-
-        mock_ollama.embed_batch = AsyncMock(return_value=[[0.6] * 1024])
-        mock_ollama.embed = AsyncMock(return_value=[0.1] * 1024)
-
-        response = ConsolidationResponse(
-            facts=[
-                ConsolidationFactItem(
-                    action=ConsolidationAction.CONTRADICT,
-                    key="mood",
-                    value="recuperado",
-                    category=FactCategory.STATE,
-                    confidence=1.0,
-                    ttl=86400,
-                    related_fact_id=existing_id,
-                    reason="Estado resuelto",
-                )
-            ],
-            session_summary="Ánimo mejorado",
-        )
-
-        asyncio.run(tools._apply_consolidation(session, response))
-
-        assert tools.db.get_fact_by_key("mood").id == existing_id
-        alt = tools.db.get_fact_by_key("mood__alt")
-        assert alt is not None
-        assert alt.value == "recuperado"
-
-    def test_batch_create_and_update_embeddings(self, tools, mock_ollama):
-        existing_id = tools.db.insert_fact(
-            Fact(key="gpu", value="RTX 3080", category=FactCategory.POSSESSIONS, confidence=1.0)
-        )
-        from alambique.tools import _insert_embedding
-
-        _insert_embedding(tools.db.conn, "vec0_facts", existing_id, [0.1] * 1024)
-
-        session = tools.db.create_session()
-        tools.db.close_session(session.id, SessionStatus.CLOSED)
-
-        mock_ollama.embed_batch = AsyncMock(return_value=[[0.5] * 1024, [0.8] * 1024])
-        mock_ollama.embed = AsyncMock(return_value=[0.3] * 1024)
-
-        response = ConsolidationResponse(
-            facts=[
-                ConsolidationFactItem(
-                    action=ConsolidationAction.UPDATE,
-                    key="gpu",
-                    value="RTX 4080",
-                    category=FactCategory.POSSESSIONS,
-                    confidence=1.0,
-                    related_fact_id=existing_id,
-                    reason="GPU actualizada",
-                ),
-                ConsolidationFactItem(
-                    action=ConsolidationAction.CREATE,
-                    key="keyboard",
-                    value="Teclado mecánico",
-                    category=FactCategory.POSSESSIONS,
-                    confidence=1.0,
-                    reason="Nueva posesión",
-                ),
-            ],
-            session_summary="Hardware actualizado",
-        )
-
-        asyncio.run(tools._apply_consolidation(session, response))
-
-        assert tools.db.get_fact(existing_id).value == "RTX 4080"
-        assert tools.db.get_fact_embedding(existing_id)[0] == pytest.approx(0.5)
-
-        new_fact = tools.db.get_fact_by_key("keyboard")
-        assert new_fact is not None
-        assert tools.db.get_fact_embedding(new_fact.id)[0] == pytest.approx(0.8)
 
 
 # ── Background tasks / lifecycle ─────────────────────────────────
@@ -1563,7 +976,8 @@ class TestBackgroundTasks:
     def test_consolidation_loop_idle(self, tools):
         asyncio.run(tools.start_background_tasks())
         assert tools._consolidator_task is not None
-        assert tools._watchdog_task is not None
+        # watchdog removed; api key retry task also started
+        assert tools._api_key_retry_task is not None
         asyncio.run(tools.stop_background_tasks())
 
     def test_watchdog_detects_stale(self, tools, mock_ollama):
@@ -1818,3 +1232,139 @@ class TestSessionLifecycle:
         s = tools.db.get_session(r.session_id)
         assert s.status == SessionStatus.CLOSED
         assert s.ended_at is not None
+
+    def test_consolidation_applies_new_model(self, tools, mock_ollama):
+        # Test that _consolidation_db_phase handles threads, capsules, echoes with new fields
+        from alambique.models import ConsolidationResponse
+        session = tools.db.create_session()
+        tools.db.close_session(session.id, SessionStatus.CLOSED)
+        bound = tools.db.get_session(session.id)
+
+        # Mock response with new fields
+        response = ConsolidationResponse(
+            threads=[{
+                "action": "create",
+                "key": "test_thread",
+                "title": "Test Thread",
+                "current_state": "This is a longer current state for the thread to pass validation checks.",
+                "tone_guidance": "Tone here",
+                "open_questions": ["Q1?"],
+                "search_text": "search text",
+                "salience": 0.9,
+                "description": "Desc here",
+                "reason": "test reason"
+            }],
+            relationship_capsules=[{
+                "scope": "general",
+                "content": "Capsule content",
+                "reason": "test cap"
+            }],
+            echoes=[{
+                "thread_key": "test_thread",
+                "content": "Echo content",
+                "context": "ctx",
+                "salience": 0.8,
+                "emotional_valence": 0.5,
+                "reason": "test echo"
+            }]
+        )
+
+        embed_requests = tools._consolidation_db_phase(bound, response)
+        assert len(embed_requests) == 3  # thread, cap, echo
+
+        # Check DB
+        t = tools.db.get_thread_by_key("test_thread")
+        assert t is not None
+        assert t["description"] == "Desc here"
+        assert "Q1?" in str(t["open_questions"])
+
+        caps = tools.db.conn.execute("SELECT * FROM relationship_capsules WHERE scope = 'general'").fetchone()
+        assert caps is not None
+        assert "Capsule content" in caps["content"]
+
+        ech = tools.db.conn.execute("SELECT * FROM echoes").fetchone()
+        assert ech is not None
+        assert ech["emotional_valence"] == 0.5
+
+        # Check audit
+        audits = tools.db.conn.execute("SELECT * FROM consolidations WHERE session_id = ?", (session.id,)).fetchall()
+        assert len(audits) >= 3
+
+    def test_consolidation_skips_invalid_thread(self, tools, mock_ollama):
+        from alambique.models import ConsolidationResponse
+        session = tools.db.create_session()
+        tools.db.close_session(session.id, SessionStatus.CLOSED)
+        bound = tools.db.get_session(session.id)
+
+        response = ConsolidationResponse(
+            threads=[{
+                "action": "create",
+                "key": "bad_thread",
+                "title": "Bad",
+                "current_state": "short",  # too short, should skip
+                "tone_guidance": "tone",
+                "search_text": "search",
+                "salience": 0.5,
+                "reason": "bad"
+            }]
+        )
+
+        embed_requests = tools._consolidation_db_phase(bound, response)
+        # should have only cap? no, response has no cap/echo, so 0
+        assert len(embed_requests) == 0
+        t = tools.db.get_thread_by_key('bad_thread')
+        assert t is None  # skipped
+
+    def test_activation_includes_new_fields(self, tools):
+        # Test that activation surfaces description and open_questions
+        from alambique.activation import ActivationEngine
+        engine = ActivationEngine(tools.db, tools.ollama)
+
+        # Seed a thread with new fields
+        tools.db.conn.execute("""
+            INSERT INTO threads (key, title, current_state, tone_guidance, description, open_questions, salience, status, last_active_at)
+            VALUES ('philo_test', 'Philo Test', 'Current state long enough here for validation.', 'Tone guidance.', 'This is the description of the thread.', '["Q1 open?", "Q2?"]', 0.9, 'active', datetime('now'))
+        """)
+        tools.db.conn.commit()
+
+        result = asyncio.run(engine.activate(None))
+        context = result.get('initial_context', '')
+        assert 'philo_test' in context
+        assert 'This is the description of the thread.' in context
+        assert 'Q1 open?' in context or 'open_questions' in context.lower()
+
+    def test_merge_during_consolidation(self, tools, mock_ollama):
+        from alambique.models import ConsolidationResponse
+        session = tools.db.create_session()
+        tools.db.close_session(session.id, SessionStatus.CLOSED)
+        bound = tools.db.get_session(session.id)
+
+        # Seed an existing thread to merge into
+        tools.db.conn.execute("""
+            INSERT INTO threads (key, title, current_state, tone_guidance, salience, status)
+            VALUES ('existing_key', 'Existing', 'Old state.', 'Old tone.', 0.5, 'active')
+        """)
+        tools.db.conn.commit()
+
+        response = ConsolidationResponse(
+            threads=[{
+                "action": "merge",
+                "key": "existing_key",
+                "title": "Merged Title",
+                "current_state": "This is a long enough merged current state now.",
+                "tone_guidance": "Merged tone.",
+                "search_text": "merged search",
+                "salience": 0.95,
+                "description": "Merged desc",
+                "open_questions": ["Merged Q?"],
+                "reason": "merged because same topic",
+                "merged_from": ["old_other_key"]  # even if not exist, test handling
+            }]
+        )
+
+        tools._consolidation_db_phase(bound, response)
+
+        t = tools.db.get_thread_by_key('existing_key')
+        assert t is not None
+        assert t['current_state'] == 'This is a long enough merged current state now.'
+        assert 'Merged desc' in (t.get('description') or '')

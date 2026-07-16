@@ -9,6 +9,7 @@ from pathlib import Path
 
 from alambique.consolidator import get_api_key
 from alambique.database import Database
+from alambique.ollama_client import OllamaClient
 from alambique.server import DB_PATH
 from alambique.tools import ToolHandler
 
@@ -25,12 +26,13 @@ async def main() -> None:
 
     db = Database(DB_PATH)
     db.connect()
+    ollama = OllamaClient()
     try:
         session = db.get_session(args.session_id)
         if not session:
             raise SystemExit(f"Session not found: {args.session_id}")
 
-        handler = ToolHandler(db, api_key=get_api_key(), online=bool(get_api_key()))
+        handler = ToolHandler(db, ollama, api_key=get_api_key())
         count = await handler._sync_session_transcript(
             args.session_id,
             session.conversation_id,
@@ -51,6 +53,7 @@ async def main() -> None:
             if session.summary:
                 print(session.summary)
     finally:
+        await ollama.close()
         db.close()
 
 

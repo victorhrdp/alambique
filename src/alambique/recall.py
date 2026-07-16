@@ -1,4 +1,4 @@
-"""Recall engine — semantic memory retrieval via Qwen3.7 Plus.
+"""Recall engine — semantic memory retrieval via MiMo-V2.5.
 
 Also handles personality composition for session_start.
 """
@@ -6,29 +6,28 @@ Also handles personality composition for session_start.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Optional
 
 import httpx
 
-from alambique.models import Fact, FactCategory
+from alambique.llm_http import LlmOutcomeCallback, post_opencode_message
+from alambique.models import Message
 
 logger = logging.getLogger("alambique.recall")
 
-RECALL_MODEL = "qwen3.7-plus"
+RECALL_MODEL = "mimo-v2.5"
 
 RECALL_PROMPT = """Eres el motor de búsqueda de memoria de "Alambique".
 
 Agente que pregunta: {agent_name}
 El usuario pregunta: "{query}"
 
-═══ HECHOS RELEVANTES ═══
-{top_facts}
-
-═══ SESIONES RELACIONADAS ═══
+═══ HILOS, CÁPSULAS Y SESIONES RELACIONADAS ═══
 {top_sessions}
 
 Redacta un resumen CONCISO (máximo 4 frases) que responda a la pregunta
-basándote exclusivamente en los hechos y sesiones proporcionados.
+basándote exclusivamente en los hilos, cápsulas y sesiones proporcionados.
 No inventes. No especules. Si no hay información suficiente, dilo.
 
 Responde SOLO con el texto del resumen, sin formato JSON ni metadatos."""
@@ -60,8 +59,13 @@ Sin JSON, sin metadatos."""
 class RecallClient:
     """Calls opencode go API for recall and personality composition."""
 
-    def __init__(self, api_key: str) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        on_outcome: LlmOutcomeCallback | None = None,
+    ) -> None:
         self.api_key = api_key
+        self._on_outcome = on_outcome
         self._client: Optional[httpx.AsyncClient] = None
 
     @property
@@ -79,76 +83,49 @@ class RecallClient:
         self,
         query: str,
         agent_name: str,
-        facts: list[dict],
-        sessions: list[dict],
+        context_items: list[dict],
     ) -> str:
-        """Compose a summary from recall results."""
-        facts_text = _format_fact_list(facts)
-        sessions_text = _format_session_list(sessions)
+        """Compose a summary from recall results (sessions, threads, capsules)."""
+        context_text = _format_session_list(context_items)  # reuse, it handles id/key/snippet
 
         prompt = RECALL_PROMPT.format(
             query=query,
             agent_name=agent_name,
-            top_facts=facts_text,
-            top_sessions=sessions_text,
+            top_sessions=context_text,
         )
 
         r = await self._call_llm(prompt)
-        return r.strip()
+        return (r or "").strip()
 
     async def compose_personality(
         self,
-        traits: list[Fact],
-        states: list[Fact],
+        capsule_text: str = "",
     ) -> str | None:
-        """Compose a personality prompt for Lucy."""
-        traits_text = _format_facts_for_personality(traits)
-        states_text = _format_facts_for_personality(states)
-
-        if not traits_text.strip() and not states_text.strip():
+        """Compose a personality prompt for Lucy from relationship capsule."""
+        if not (capsule_text or "").strip():
             return None
 
         prompt = PERSONALITY_PROMPT.format(
-            traits=traits_text or "(sin rasgos definidos aún)",
-            moods=states_text or "(sin estados temporales)",
+            traits=capsule_text,
+            moods="(sin estados temporales)",
         )
 
         r = await self._call_llm(prompt)
-        r = r.strip()
+        r = (r or "").strip()
         if r.lower() == "null" or not r:
             return None
         return r
 
     async def _call_llm(self, prompt: str) -> str:
-        r = await self.client.post(
-            "https://opencode.ai/zen/go/v1/messages",
-            headers={
-                "x-api-key": self.api_key,
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": RECALL_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 512,
-                "thinking": {"type": "disabled"},
-            },
+        return await post_opencode_message(
+            self.client,
+            self.api_key,
+            model=RECALL_MODEL,
+            prompt=prompt,
+            max_tokens=512,
+            on_outcome=self._on_outcome,
+            log_prefix="Recall LLM",
         )
-        r.raise_for_status()
-        data = r.json()
-        # Anthropic-compatible format: content is an array of blocks
-        for block in data["content"]:
-            if block.get("type") == "text":
-                return block["text"]
-        return ""
-
-
-def _format_fact_list(facts: list[dict]) -> str:
-    if not facts:
-        return "(sin hechos relevantes)"
-    lines = []
-    for f in facts:
-        lines.append(f"- [{f.get('category', '?')}] {f.get('key', '?')}: {f.get('value', '?')}")
-    return "\n".join(lines)
 
 
 def _format_session_list(sessions: list[dict]) -> str:
@@ -160,11 +137,4 @@ def _format_session_list(sessions: list[dict]) -> str:
         sid = s.get("id", "")
         prefix = f"[{sid}] " if sid else ""
         lines.append(f"- {prefix}{text}")
-    return "\n".join(lines)
-
-
-def _format_facts_for_personality(facts: list[Fact]) -> str:
-    lines = []
-    for f in facts:
-        lines.append(f"  [{f.confidence:.1f}] {f.key}: {f.value}")
     return "\n".join(lines)

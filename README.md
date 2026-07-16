@@ -8,9 +8,9 @@ Memoria semántica y episódica para el asistente virtual **Lucy** (v0.2.3 — G
 |---|---|---|
 | Persistencia | SQLite WAL + `sqlite-vec` | Sesiones, mensajes, hechos, embeddings |
 | Embeddings | Ollama `bge-m3` (1024d) | Búsqueda semántica local |
-| Razonamiento | OpenCode Go `qwen3.7-plus` | Consolidación y recall narrativo |
+| Razonamiento | OpenCode Go `deepseek-v4-pro` (consolidación) · `mimo-v2.5` (recall/persona) | Destilación y narrativo |
 | Transcripts | `GrokCliProvider`, `AntigravityCliProvider`, `OpenCodeCliProvider` | Importación batch al cerrar sesión |
-| Daemon | MCP SSE en `:9042` | 12 herramientas + watchdog + consolidación async |
+| Daemon | MCP SSE en `:9042` | 14 herramientas + watchdog + consolidación async |
 
 Ámbito exclusivo Lucy — sin namespaces ni multi-agente.
 
@@ -102,31 +102,37 @@ MCP en `~/.config/opencode/opencode.jsonc` → `http://localhost:9042/sse`.
 
 Filtro de diálogo: mensajes `user` con partes `text`; asistente solo con `finish != tool-calls` (respuesta final visible).
 
+### Nuevo modelo de memoria (rediseño)
+
+`session_start` ahora devuelve `initial_context` (bloque denso pre-procesado) + `active_thread_keys` además de `persona`.
+- Inyecta `initial_context` al inicio del prompt del agente como "memoria activa / hilo conductor".
+- Usa `memory_expand_thread(key)` on-demand para más profundidad en un tema específico.
+- La consolidación genera **threads temáticos** (con `current_state`, `tone_guidance`, echoes, capsules) en vez de un único summary.
+
 ### Respuestas clave
 
 | Tool | Campos útiles |
 |---|---|
-| `session_start` | `session_id`, `persona`, `client`, `conversation_id`, `session_reused`, `warnings`, `degraded` |
+| `session_start` | `session_id`, `persona`, `initial_context`, `active_thread_keys`, `client`, `conversation_id`, `session_reused`, `warnings`, `degraded` |
 | `session_end` | `queued`, `pending_consolidation` |
 
 ---
 
-## Herramientas MCP (12)
+## Herramientas MCP
 
 | Tool | Uso |
 |---|---|
-| `session_start` | Abre sesión, binding transcript, persona |
+| `session_start` | Abre sesión, binding transcript, `persona` + `initial_context` (hilo conductor: threads + cápsula relación + ecos) + `active_thread_keys` |
 | `session_end` | Sync transcript, cierra, encola consolidación |
-| `memory_recall` | Búsqueda semántica + resumen LLM |
+| `session_update` | Actualiza expresión y estado de ánimo de Lucy (widget KDE) |
+| `memory_expand_thread` | Expansión on-demand de un thread temático (estado denso completo + ecos + participaciones) |
+| `memory_recall` | Búsqueda semántica + resumen LLM (fallback) |
 | `memory_search` | FTS5 en mensajes |
 | `memory_context` | Mensajes literales paginados (+ `client`/`conversation_id`) |
 | `memory_status` | Estadísticas |
 | `memory_health` | Diagnóstico (Ollama, API, cola, embeddings) |
-| `memory_reembed` | Repara embeddings huérfanos |
-| `memory_deduplicate` | Fusiona hechos duplicados (`dry_run` por defecto) |
+| `memory_rebuild_vectors` | Rebuild completo vec0 (`dry_run` por defecto) |
 | `session_list` | Sesiones recientes (+ binding) |
-| `memory_forget` | Soft-delete de hecho |
-| `memory_export` | Export JSON facts + sesiones |
 
 ---
 
@@ -140,7 +146,7 @@ Filtro de diálogo: mensajes `user` con partes `text`; asistente solo con `finis
 
 ## Pruebas
 
-**272** pruebas unitarias (DB, Ollama, consolidación, Grok CLI, herramientas MCP).
+**304** pruebas unitarias (DB, Ollama, consolidación, Grok CLI, herramientas MCP).
 
 ```bash
 .venv/bin/pytest -v

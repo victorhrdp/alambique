@@ -153,7 +153,7 @@ def _extract_user_text(text: str) -> str | None:
         if end > start:
             return text[start:end].strip()
 
-    if "<user_info>" in text:
+    if "<user_info>" in text or "<system-reminder>" in text:
         return None
 
     stripped = text.strip()
@@ -194,7 +194,14 @@ def _parse_chat_history(path: Path) -> list[dict[str, str]]:
             elif record_type == "assistant":
                 content = record.get("content", "")
                 if isinstance(content, str) and content.strip():
-                    messages.append({"role": "assistant", "content": content})
+                    # Strip system-reminders and large internal context to avoid bloating embeddings and consolidation
+                    if "<system-reminder>" in content or "<user_info>" in content:
+                        # keep only up to first reminder or clean
+                        idx = content.find("<system-reminder>")
+                        if idx > 0:
+                            content = content[:idx].strip()
+                    if content:
+                        messages.append({"role": "assistant", "content": content})
 
     return messages
 
@@ -222,3 +229,4 @@ class GrokCliProvider(BaseTranscriptProvider):
             return []
 
         return _parse_chat_history(path)
+

@@ -11,8 +11,6 @@ from alambique.database import Database, SCHEMA_VERSION
 from alambique.models import (
     Consolidation,
     ConsolidationAction,
-    Fact,
-    FactCategory,
     Message,
     Session,
     SessionStatus,
@@ -51,7 +49,7 @@ class TestDatabaseLifecycle:
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()
         }
-        for t in ("sessions", "messages", "facts", "consolidations"):
+        for t in ("sessions", "messages", "consolidations"):
             assert t in tables, f"Table {t} not found"
 
     def test_wal_mode(self, db):
@@ -176,262 +174,41 @@ class TestMessages:
         assert "palabra_secreta" in results[0]["content"]
 
 
-class TestFacts:
-    def test_insert_fact(self, db):
-        f = Fact(
-            key="nombre",
-            value="Víctor",
-            category=FactCategory.PERSONAL,
-            confidence=1.0,
-        )
-        fid = db.insert_fact(f)
-        assert fid > 0
-
-    def test_get_fact(self, db):
-        f = Fact(
-            key="sarcastic",
-            value="Es sarcástica",
-            category=FactCategory.PERSONALITY,
-            confidence=0.9,
-        )
-        fid = db.insert_fact(f)
-        retrieved = db.get_fact(fid)
-        assert retrieved.key == "sarcastic"
-        assert retrieved.value == "Es sarcástica"
-        assert retrieved.category == FactCategory.PERSONALITY
-        assert retrieved.confidence == 0.9
-
-    def test_get_fact_nonexistent(self, db):
-        assert db.get_fact(9999) is None
-
-    def test_update_fact(self, db):
-        f = Fact(
-            key="editor",
-            value="VS Code",
-            category=FactCategory.PREFERENCE,
-        )
-        fid = db.insert_fact(f)
-        db.update_fact(fid, "Neovim", 1.0)
-        updated = db.get_fact(fid)
-        assert updated.value == "Neovim"
-
-    def test_update_fact_category_and_ttl(self, db):
-        f = Fact(
-            key="neck",
-            value="duele",
-            category=FactCategory.PERSONAL,
-        )
-        fid = db.insert_fact(f)
-        db.update_fact(
-            fid,
-            "ya no duele",
-            1.0,
-            category=FactCategory.STATE,
-            ttl=86400,
-        )
-        updated = db.get_fact(fid)
-        assert updated.value == "ya no duele"
-        assert updated.category == FactCategory.STATE
-        assert updated.ttl == 86400
-
-    def test_migrate_legacy_categories(self, db):
-        db.conn.execute(
-            "INSERT INTO facts (key, value, category, confidence) "
-            "VALUES ('hw1', 'GPU', 'hardware', 1.0)"
-        )
-        db.conn.execute(
-            "INSERT INTO facts (key, value, category, confidence) "
-            "VALUES ('m1', 'tired', 'mood', 1.0)"
-        )
-        db.conn.commit()
-        counts = db.migrate_legacy_categories()
-        assert counts["possessions"] >= 1
-        assert counts["state"] >= 1
-        hw = db.get_fact_by_key("hw1")
-        assert hw.category == FactCategory.POSSESSIONS
-        st = db.get_fact_by_key("m1")
-        assert st.category == FactCategory.STATE
-        assert st.ttl == 86400
-
-    def test_forget_fact(self, db):
-        from alambique.tools import _insert_embedding
-
-        f = Fact(
-            key="temp",
-            value="to forget",
-            category=FactCategory.PERSONAL,
-        )
-        fid = db.insert_fact(f)
-        _insert_embedding(db.conn, "vec0_facts", fid, [0.1] * 1024)
-        db.forget_fact(fid)
-        forgotten = db.get_fact(fid)
-        assert forgotten.confidence == 0
-        rows = db.conn.execute(
-            "SELECT rowid FROM vec0_facts WHERE rowid = ?", (fid,)
-        ).fetchall()
-        assert rows == []
-
-    def test_get_fact_by_key(self, db):
-        f = Fact(
-            key="trait_1",
-            value="graciosa",
-            category=FactCategory.PERSONALITY,
-        )
-        db.insert_fact(f)
-        found = db.get_fact_by_key("trait_1")
-        assert found.key == "trait_1"
-
-    def test_active_key_unique_index_exists(self, db):
-        indexes = {
-            r[0]
-            for r in db.conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='index'"
-            ).fetchall()
-        }
-        assert "idx_facts_key_active" in indexes
-
-    def test_duplicate_active_key_rejected(self, db):
-        db.insert_fact(
-            Fact(key="city", value="Madrid", category=FactCategory.PERSONAL)
-        )
-        with pytest.raises(sqlite3.IntegrityError):
-            db.insert_fact(
-                Fact(key="city", value="Barcelona", category=FactCategory.PERSONAL)
-            )
-
-    def test_forgotten_key_can_be_reused(self, db):
-        fid = db.insert_fact(
-            Fact(key="old_pref", value="vim", category=FactCategory.PREFERENCE)
-        )
-        db.forget_fact(fid)
-        new_id = db.insert_fact(
-            Fact(key="old_pref", value="neovim", category=FactCategory.PREFERENCE)
-        )
-        assert new_id != fid
-        active = db.get_fact_by_key("old_pref")
-        assert active.value == "neovim"
-
-    def test_deduplicate_active_fact_keys(self, db):
-        db.conn.execute("DROP INDEX IF EXISTS idx_facts_key_active")
-        db.insert_fact(
-            Fact(key="dup", value="keeper", category=FactCategory.PERSONAL, confidence=1.0)
-        )
-        db.insert_fact(
-            Fact(key="dup", value="loser", category=FactCategory.PERSONAL, confidence=0.6)
-        )
-        removed = db._deduplicate_active_fact_keys()
-        assert removed == 1
-        keeper = db.get_fact_by_key("dup")
-        assert keeper.value == "keeper"
-        db._ensure_facts_key_index()
-
-    def test_migrate_v2_to_v3(self, db):
-        db.conn.execute("DROP INDEX IF EXISTS idx_facts_key_active")
-        db.conn.execute("PRAGMA user_version = 2")
-        db.conn.commit()
-        db.insert_fact(
-            Fact(key="dup", value="best", category=FactCategory.PREFERENCE, confidence=0.9)
-        )
-        db.insert_fact(
-            Fact(key="dup", value="weak", category=FactCategory.PREFERENCE, confidence=0.4)
-        )
-        db._migrate_v2_to_v3()
-        version = db.conn.execute("PRAGMA user_version").fetchone()[0]
-        assert version == 3
-        assert db.get_fact_by_key("dup").value == "best"
-        with pytest.raises(sqlite3.IntegrityError):
-            db.insert_fact(
-                Fact(key="dup", value="again", category=FactCategory.PREFERENCE)
-            )
-
-    def test_get_facts_by_category(self, db):
-        db.insert_fact(Fact(key="p1", value="a", category=FactCategory.PERSONALITY))
-        db.insert_fact(Fact(key="p2", value="b", category=FactCategory.PERSONALITY))
-        facts = db.get_facts_by_category(FactCategory.PERSONALITY)
-        assert len(facts) == 2
-
-    def test_get_facts(self, db):
-        db.insert_fact(Fact(key="p1", value="a", category=FactCategory.PERSONALITY))
-        db.insert_fact(Fact(key="m1", value="b", category=FactCategory.STATE, ttl=86400))
-        db.insert_fact(Fact(key="s1", value="c", category=FactCategory.PERSONAL))
-        facts = db.get_facts()
-        assert len(facts) == 2  # Only personality and state by default
-
-    def test_get_recent_facts(self, db):
-        db.insert_fact(
-            Fact(key="secret", value="dato privado", category=FactCategory.PERSONAL)
-        )
-        db.insert_fact(
-            Fact(
-                key="gaming",
-                value="mató tabernero",
-                category=FactCategory.PERSONAL,
-            )
-        )
-
-        recent_facts = db.get_recent_facts(limit=10)
-        assert len(recent_facts) == 2
-
-    def test_get_recent_facts_samples_per_category(self, db):
-        for cat in FactCategory:
-            db.insert_fact(
-                Fact(key=f"f_{cat.value}", value="v", category=cat)
-            )
-        facts = db.get_recent_facts(limit=5)
-        assert len(facts) == 5
-
-    def test_ttl_filtering_active_fact(self, db):
-        """A fact with TTL=86400 created now should be found."""
-        conn = db.conn
-        conn.execute(
-            "INSERT INTO facts (key, value, category, ttl, confidence, created_at) "
-            "VALUES (?, ?, ?, ?, ?, datetime('now'))",
-            ("state_today", "happy", "state", 86400, 1.0),
-        )
-        conn.commit()
-        facts = db.get_facts_by_category(FactCategory.STATE)
-        assert len(facts) == 1
-
-    def test_ttl_filtering_expired(self, db):
-        """A fact with TTL=1 created 2 hours ago should be filtered out."""
-        conn = db.conn
-        conn.execute(
-            "INSERT INTO facts (key, value, category, ttl, confidence, created_at) "
-            "VALUES (?, ?, ?, ?, ?, datetime('now', '-2 hours'))",
-            ("state_old", "sad", "state", 1, 1.0),
-        )
-        conn.commit()
-        facts = db.get_facts_by_category(FactCategory.STATE)
-        assert len(facts) == 0
-
-    def test_ttl_null_always_valid(self, db):
-        """A fact with TTL=NULL should never expire."""
-        conn = db.conn
-        conn.execute(
-            "INSERT INTO facts (key, value, category, ttl, confidence, created_at) "
-            "VALUES (?, ?, ?, NULL, ?, datetime('now', '-100 days'))",
-            ("old_fact", "still here", "personal", 1.0),
-        )
-        conn.commit()
-        facts = db.get_facts_by_category(FactCategory.PERSONAL)
-        assert len(facts) == 1
-
+# TestFacts class removed - legacy facts system eliminated
 
 class TestConsolidations:
     def test_insert_consolidation(self, db):
         s = db.create_session()
         db.close_session(s.id)
-        f = Fact(key="k", value="v", category=FactCategory.PERSONAL)
-        fid = db.insert_fact(f)
         c = Consolidation(
             session_id=s.id,
             action=ConsolidationAction.CREATE,
-            fact_id=fid,
-            new_value="v",
-            reason="test",
+            thread_id=42,
+            reason="test thread create",
         )
         cid = db.insert_consolidation(c)
         assert cid > 0
+
+    def test_insert_consolidation_new_model(self, db):
+        s = db.create_session()
+        db.close_session(s.id)
+        c = Consolidation(
+            session_id=s.id,
+            action=ConsolidationAction.UPDATE,
+            capsule_scope="general",
+            reason="capsule update",
+        )
+        cid = db.insert_consolidation(c)
+        assert cid > 0
+
+        c2 = Consolidation(
+            session_id=s.id,
+            action=ConsolidationAction.CREATE,
+            echo_id=99,
+            reason="echo create",
+        )
+        cid2 = db.insert_consolidation(c2)
+        assert cid2 > 0
 
     def test_count_pending(self, db):
         s = db.create_session()
@@ -441,33 +218,64 @@ class TestConsolidations:
     def test_last_consolidation(self, db):
         s = db.create_session()
         db.close_session(s.id)
-        f = Fact(key="k", value="v", category=FactCategory.PERSONAL)
-        fid = db.insert_fact(f)
         c = Consolidation(
             session_id=s.id,
             action=ConsolidationAction.CREATE,
-            fact_id=fid,
-            new_value="v",
+            thread_id=1,
             reason="test",
         )
         db.insert_consolidation(c)
         last = db.last_consolidation_time()
         assert last is not None
 
+    def test_new_entity_embedding_counts(self, db):
+        # Add some threads etc to test counts (no vec yet)
+        db.conn.execute("INSERT INTO threads (key, title, current_state) VALUES ('t1', 't1', 'state')")
+        db.conn.execute("INSERT INTO relationship_capsules (scope, content) VALUES ('c1', 'cont')")
+        db.conn.execute("INSERT INTO echoes (content) VALUES ('e1')")
+        db.conn.commit()
+        assert db.count_threads_missing_embeddings() >= 1
+        assert db.count_capsules_missing_embeddings() >= 1
+        assert db.count_echoes_missing_embeddings() >= 1
+
+
+def test_legacy_facts_migration(tmp_path):
+        # Simulate old DB with facts table for personality
+        d = Database(tmp_path / "old.db")
+        d.connect()
+        d.conn.execute("CREATE TABLE IF NOT EXISTS facts (key TEXT, value TEXT, category TEXT, confidence REAL)")
+        d.conn.execute("INSERT INTO facts (key, value, category, confidence) VALUES ('trait1', 'val1', 'personality', 1.0)")
+        d.conn.commit()
+        d._migrate_legacy_facts_to_capsules()
+        cap = d.get_relevant_relationship_capsule("personality")
+        assert cap is not None and ("trait1" in cap or "personality" in cap.lower())
+        assert not d._table_exists("facts")
+        d.close()
 
 class TestMemoryExport:
-    def test_get_all_facts(self, db):
-        db.insert_fact(Fact(key="k1", value="v1", category=FactCategory.PERSONAL))
-        db.insert_fact(Fact(key="k2", value="v2", category=FactCategory.PERSONALITY))
-        facts = db.get_all_facts()
-        assert len(facts) == 2
-
     def test_get_all_sessions(self, db):
         s1 = db.create_session()
         s2 = db.create_session()
         sessions = db.get_all_sessions()
         assert len(sessions) == 2
 
+
+def test_legacy_facts_migration(tmp_path):
+    # Simulate old DB with facts table
+    d = Database(tmp_path / "old.db")
+    d.connect()
+    # create minimal facts
+    d.conn.execute("CREATE TABLE IF NOT EXISTS facts (id INTEGER, key TEXT, value TEXT, category TEXT, confidence REAL)")
+    d.conn.execute("INSERT INTO facts (key, value, category, confidence) VALUES ('trait1', 'val1', 'personality', 1.0)")
+    d.conn.commit()
+    # call migration
+    d._migrate_legacy_facts_to_capsules()
+    # should have capsule
+    cap = d.get_relevant_relationship_capsule("personality")
+    assert "trait1" in cap or "personality" in (cap or "")
+    # facts gone
+    assert not d._table_exists("facts")
+    d.close()
 
 V1_BOOTSTRAP_SQL = """
 CREATE TABLE sessions (
@@ -488,23 +296,10 @@ CREATE TABLE messages (
     tool_results  TEXT,
     timestamp     TEXT NOT NULL DEFAULT (datetime('now'))
 );
-CREATE TABLE facts (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    namespace       TEXT NOT NULL,
-    key             TEXT NOT NULL,
-    value           TEXT NOT NULL,
-    category        TEXT NOT NULL,
-    ttl             INTEGER,
-    confidence      REAL NOT NULL DEFAULT 1.0,
-    access_count    INTEGER NOT NULL DEFAULT 0,
-    last_accessed   TEXT NOT NULL DEFAULT (datetime('now')),
-    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
-);
 CREATE TABLE consolidations (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id      TEXT NOT NULL,
     action          TEXT NOT NULL,
-    fact_id         INTEGER,
     previous_value  TEXT,
     new_value       TEXT,
     reason          TEXT,
@@ -536,18 +331,6 @@ def _seed_v1_database(path: Path) -> None:
         "INSERT INTO messages (session_id, role, content) "
         "VALUES ('sess_aria1', 'user', 'hola aria')"
     )
-    conn.execute(
-        "INSERT INTO facts (namespace, key, value, category) "
-        "VALUES ('lucy', 'user_name', 'Víctor', 'personal')"
-    )
-    conn.execute(
-        "INSERT INTO facts (namespace, key, value, category) "
-        "VALUES ('shared', 'user_name', 'Victor G', 'personal')"
-    )
-    conn.execute(
-        "INSERT INTO facts (namespace, key, value, category) "
-        "VALUES ('aria', 'game_map', 'Phandalin', 'preference')"
-    )
     conn.execute("PRAGMA user_version = 1")
     conn.commit()
     conn.close()
@@ -569,16 +352,8 @@ class TestV1Migration:
 
         version = d.conn.execute("PRAGMA user_version").fetchone()[0]
         assert version == SCHEMA_VERSION
-        assert not d._column_exists("facts", "namespace")
         assert not d._column_exists("sessions", "agent")
         assert not d._table_exists("agents")
-
-        name_fact = d.get_fact_by_key("user_name")
-        assert name_fact is not None
-        assert name_fact.value == "Víctor"
-
-        keys = {f.key for f in d.get_all_facts()}
-        assert "game_map" not in keys
 
         assert d.get_session("sess_lucy1") is not None
         assert d.get_session("sess_aria1") is None
@@ -611,12 +386,10 @@ class TestV3ToV4Migration:
 
         s = d2.create_session()
         d2.close_session(s.id)
-        fid = d2.insert_fact(Fact(key="k", value="v", category=FactCategory.PERSONAL))
         cid = d2.insert_consolidation(
             Consolidation(
                 session_id=s.id,
                 action=ConsolidationAction.CREATE,
-                fact_id=fid,
                 new_value="v",
                 reason="post-v4",
             )

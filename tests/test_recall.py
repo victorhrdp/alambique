@@ -1,40 +1,16 @@
 """Tests for recall engine — formatting and prompt generation."""
 
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import httpx
+import pytest
+
 from alambique.recall import (
-    _format_fact_list,
+    RecallClient,
     _format_session_list,
-    _format_facts_for_personality,
     RECALL_PROMPT,
     PERSONALITY_PROMPT,
 )
-from alambique.models import Fact, FactCategory
-
-
-# ── Fact formatting ──────────────────────────────────────────────
-
-
-class TestFormatFactList:
-    def test_empty(self):
-        assert _format_fact_list([]) == "(sin hechos relevantes)"
-
-    def test_single_fact(self):
-        facts = [{"category": "personal", "key": "nombre", "value": "Víctor"}]
-        result = _format_fact_list(facts)
-        assert "- [personal] nombre: Víctor" in result
-
-    def test_multiple_facts(self):
-        facts = [
-            {"category": "personal", "key": "a", "value": "v1"},
-            {"category": "possessions", "key": "b", "value": "v2"},
-        ]
-        result = _format_fact_list(facts)
-        lines = result.split("\n")
-        assert len(lines) == 2
-
-    def test_missing_fields(self):
-        facts = [{}]
-        result = _format_fact_list(facts)
-        assert "[?]" in result
 
 
 # ── Session formatting ───────────────────────────────────────────
@@ -61,52 +37,6 @@ class TestFormatSessionList:
         assert "algo" in result
 
 
-# ── Personality formatting ───────────────────────────────────────
-
-
-class TestFormatFactsForPersonality:
-    def test_empty(self):
-        assert _format_facts_for_personality([]) == ""
-
-    def test_single_trait(self):
-        facts = [
-            Fact(key="sarcastic",
-                value="Es sarcástica en sus respuestas",
-                category=FactCategory.PERSONALITY,
-                confidence=0.9,
-            )
-        ]
-        result = _format_facts_for_personality(facts)
-        assert "[0.9] sarcastic:" in result
-        assert "Es sarcástica" in result
-
-    def test_multiple_traits_sorted_by_confidence(self):
-        facts = [
-            Fact(key="t1", value="v1", category=FactCategory.PERSONALITY, confidence=0.5),
-            Fact(key="t2", value="v2", category=FactCategory.PERSONALITY, confidence=1.0),
-            Fact(key="t3", value="v3", category=FactCategory.PERSONALITY, confidence=0.8),
-        ]
-        result = _format_facts_for_personality(facts)
-        lines = result.split("\n")
-        assert len(lines) == 3
-        # Should be in input order (no explicit sort here, up to caller)
-        assert "[0.5]" in lines[0]
-        assert "[1.0]" in lines[1]
-
-    def test_state_formatting(self):
-        facts = [
-            Fact(key="hoy_depre",
-                value="Hoy está deprimido, sin bromas",
-                category=FactCategory.STATE,
-                ttl=86400,
-                confidence=1.0,
-            )
-        ]
-        result = _format_facts_for_personality(facts)
-        assert "hoy_depre" in result
-        assert "deprimido" in result
-
-
 # ── Recall Prompt ────────────────────────────────────────────────
 
 
@@ -114,19 +44,16 @@ class TestRecallPrompt:
     def test_contains_placeholders(self):
         assert "{agent_name}" in RECALL_PROMPT
         assert "{query}" in RECALL_PROMPT
-        assert "{top_facts}" in RECALL_PROMPT
         assert "{top_sessions}" in RECALL_PROMPT
 
     def test_format_valid(self):
         formatted = RECALL_PROMPT.format(
             agent_name="lucy",
             query="juegos cooperativos",
-            top_facts="- [personal] nombre: Víctor",
             top_sessions="- [sess_1] Charla sobre gaming",
         )
         assert "lucy" in formatted
         assert "juegos cooperativos" in formatted
-        assert "nombre: Víctor" in formatted
         assert "Charla sobre gaming" in formatted
 
     def test_max_4_frases(self):
@@ -170,3 +97,92 @@ class TestPersonalityPrompt:
     def test_moods_at_end(self):
         assert "paréntesis" in PERSONALITY_PROMPT
         assert "hoy:" in PERSONALITY_PROMPT
+
+
+# ── LLM retries ──────────────────────────────────────────────────
+
+
+def _http_status_error(status_code: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "https://opencode.ai/zen/go/v1/messages")
+    response = httpx.Response(status_code, request=request)
+    return httpx.HTTPStatusError("error", request=request, response=response)
+
+
+def _ok_response(text: str = "resumen ok", *, content_null: bool = False) -> MagicMock:
+    mock = MagicMock()
+    mock.raise_for_status = MagicMock()
+    content = None if content_null else text
+    mock.json.return_value = {
+        "choices": [{"message": {"role": "assistant", "content": content}}]
+    }
+    return mock
+
+
+class TestRecallClientRetries:
+    @pytest.mark.asyncio
+    async def test_retries_on_500_then_succeeds(self):
+        client = RecallClient("test-key")
+        client._client = AsyncMock()
+        client._client.post = AsyncMock(
+            side_effect=[
+                _http_status_error(500),
+                _ok_response("tras reintento"),
+            ]
+        )
+
+        with patch("alambique.llm_http.asyncio.sleep", new_callable=AsyncMock):
+            result = await client._call_llm("prompt")
+
+        assert result == "tras reintento"
+        assert client._client.post.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_raises_after_max_attempts(self):
+        client = RecallClient("test-key")
+        client._client = AsyncMock()
+        client._client.post = AsyncMock(side_effect=_http_status_error(500))
+
+        with patch("alambique.llm_http.asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(httpx.HTTPStatusError):
+                await client._call_llm("prompt")
+
+        assert client._client.post.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_no_retry_on_4xx(self):
+        client = RecallClient("test-key")
+        client._client = AsyncMock()
+        client._client.post = AsyncMock(side_effect=_http_status_error(401))
+
+        with pytest.raises(httpx.HTTPStatusError):
+            await client._call_llm("prompt")
+
+        client._client.post.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_retries_on_timeout(self):
+        client = RecallClient("test-key")
+        client._client = AsyncMock()
+        client._client.post = AsyncMock(
+            side_effect=[
+                httpx.ReadTimeout("timeout"),
+                _ok_response(),
+            ]
+        )
+
+        with patch("alambique.llm_http.asyncio.sleep", new_callable=AsyncMock):
+            result = await client._call_llm("prompt")
+
+        assert result == "resumen ok"
+        assert client._client.post.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_null_content_returns_empty_string(self):
+        """OpenCode sometimes returns content: null (reasoning-only); must not crash on .strip()."""
+        client = RecallClient("test-key")
+        client._client = AsyncMock()
+        client._client.post = AsyncMock(return_value=_ok_response(content_null=True))
+
+        result = await client._call_llm("prompt")
+        assert result == ""
+        assert (result or "").strip() == ""

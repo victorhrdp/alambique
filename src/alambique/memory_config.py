@@ -7,6 +7,12 @@ live here so behaviour can be adjusted without touching business logic.
 # Single-agent scope: all memory belongs to Lucy.
 AGENT_NAME: str = "Lucy"
 
+# Valid avatar expressions for session_update (KDE widget).
+VALID_EXPRESSIONS: frozenset[str] = frozenset({
+    "normal", "happy", "wink", "blushing", "thinking",
+    "sad", "angry", "sleepy", "surprised",
+})
+
 # ── Ebbinghaus decay (λ in 1/seconds) ─────────────────────────────
 # Formula: confidence * exp(-λ * elapsed_seconds), with spaced-reinforcement
 # divisor log(access_count + 1). Approximate daily loss at access_count=0:
@@ -45,6 +51,13 @@ RECALL_TOP_K: int = 10
 
 CONSOLIDATION_CANDIDATE_POOL: int = 30
 CONSOLIDATION_TOP_K: int = 15
+
+# ── LLM calls (recall summary, personality composition) ───────────
+# Retries transient OpenCode/network failures before surfacing to callers.
+
+LLM_RETRY_MAX_ATTEMPTS: int = 3
+LLM_RETRY_BASE_DELAY_SECONDS: float = 1.0
+LLM_INSTABILITY_WINDOW_SECONDS: int = 600
 
 # ── Data quality (Phase D) ─────────────────────────────────────────
 # Cosine-like similarity via vec0 distance: sim = 1 / (1 + distance).

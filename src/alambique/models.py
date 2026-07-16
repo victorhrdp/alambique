@@ -6,13 +6,6 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
-from alambique.memory_config import (
-    FLOOR_POSSESSIONS,
-    FLOOR_PREFERENCE,
-    LAMBDA_POSSESSIONS,
-    LAMBDA_PREFERENCE,
-)
-
 
 # ── Enums ──────────────────────────────────────────────────────────
 
@@ -21,14 +14,6 @@ class SessionStatus(str, Enum):
     OPEN = "open"
     CLOSED = "closed"
     TRUNCATED = "truncated"
-
-
-class FactCategory(str, Enum):
-    PERSONALITY = "personality"
-    STATE = "state"
-    PERSONAL = "personal"
-    PREFERENCE = "preference"
-    POSSESSIONS = "possessions"
 
 
 class ConsolidationAction(str, Enum):
@@ -52,6 +37,8 @@ class Session(BaseModel):
     summary: Optional[str] = None
     client: Optional[str] = None
     conversation_id: Optional[str] = None
+    expression: Optional[str] = None
+    mood_text: Optional[str] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(_utc))
     ended_at: Optional[datetime] = None
 
@@ -66,81 +53,13 @@ class Message(BaseModel):
     timestamp: datetime = Field(default_factory=lambda: datetime.now(_utc))
 
 
-class Fact(BaseModel):
-    id: Optional[int] = None
-    key: str
-    value: str
-    category: FactCategory
-    ttl: Optional[int] = None
-    confidence: float = 1.0
-    access_count: int = 0
-    last_accessed: datetime = Field(default_factory=lambda: datetime.now(_utc))
-    created_at: datetime = Field(default_factory=lambda: datetime.now(_utc))
-
-    def get_decayed_confidence(self) -> float:
-        import math
-        # 1. Immune categories: stable facts, agent personality, temporal states (TTL-only)
-        if self.category in (
-            FactCategory.PERSONAL,
-            FactCategory.PERSONALITY,
-            FactCategory.STATE,
-        ):
-            return self.confidence
-
-        # 2. Base decay rates (decay constant lambda)
-        if self.category == FactCategory.POSSESSIONS:
-            lambda_base = LAMBDA_POSSESSIONS
-        else:
-            lambda_base = LAMBDA_PREFERENCE
-
-        # 3. Spaced reinforcement: more access count decreases rate of forgetting
-        adjusted_lambda = lambda_base / (1.0 + math.log(self.access_count + 1))
-
-        # 4. Calculate elapsed time in seconds
-        # Handle timezone-aware vs naive created_at
-        created = self.created_at
-        if created.tzinfo is not None:
-            now = datetime.now(timezone.utc)
-        else:
-            now = datetime.now()
-        
-        elapsed_seconds = (now - created).total_seconds()
-        if elapsed_seconds < 0:
-            elapsed_seconds = 0
-
-        # 5. Exponential decay formula
-        decayed_value = self.confidence * math.exp(-adjusted_lambda * elapsed_seconds)
-
-        # 6. Apply floor to prevent complete deletion from database
-        floor = (
-            FLOOR_PREFERENCE
-            if self.category == FactCategory.PREFERENCE
-            else FLOOR_POSSESSIONS
-        )
-        return round(max(decayed_value, floor), 4)
-
-    def is_ttl_expired(self) -> bool:
-        """True if the fact's TTL has elapsed (state facts expire via TTL only)."""
-        if self.ttl is None:
-            return False
-        created = self.created_at
-        if created.tzinfo is not None:
-            now = datetime.now(timezone.utc)
-        else:
-            now = datetime.now()
-        elapsed = (now - created).total_seconds()
-        return elapsed >= self.ttl
-
-    def is_active(self) -> bool:
-        """Visible for recall: positive confidence and TTL not expired."""
-        return self.confidence > 0 and not self.is_ttl_expired()
-
-
 class Consolidation(BaseModel):
     id: Optional[int] = None
     session_id: str
     action: ConsolidationAction
-    fact_id: Optional[int] = None
+    thread_id: Optional[int] = None
+    capsule_scope: Optional[str] = None
+    echo_id: Optional[int] = None
     previous_value: Optional[str] = None
     new_value: Optional[str] = None
     reason: Optional[str] = None
@@ -159,6 +78,8 @@ class SessionStartOutput(BaseModel):
     is_new: bool = False
     degraded: bool = False
     warnings: list[str] = Field(default_factory=list)
+    initial_context: Optional[str] = None
+    active_thread_keys: list[str] = Field(default_factory=list)
 
 
 class SessionEndOutput(BaseModel):
@@ -168,8 +89,9 @@ class SessionEndOutput(BaseModel):
 
 class MemoryRecallOutput(BaseModel):
     summary: str
-    facts: list[dict[str, Any]] = Field(default_factory=list)
     related_sessions: list[dict[str, Any]] = Field(default_factory=list)
+    related_threads: list[dict[str, Any]] = Field(default_factory=list)
+    related_capsules: list[dict[str, Any]] = Field(default_factory=list)
     degraded: bool = False
     warnings: list[str] = Field(default_factory=list)
 
@@ -178,39 +100,29 @@ class MemorySearchOutput(BaseModel):
     results: list[dict[str, Any]] = Field(default_factory=list)
 
 
-class MemoryForgetOutput(BaseModel):
-    deleted: bool = True
-
-
-class MemoryCleanupOutput(BaseModel):
-    stale_embeddings_removed: int = 0
-
-
-class MemoryReembedOutput(BaseModel):
-    dry_run: bool = False
-    missing_before: int = 0
-    embedded: int = 0
-    failed: int = 0
-    fact_ids: list[int] = Field(default_factory=list)
-    warnings: list[str] = Field(default_factory=list)
-
-
-class MemoryDeduplicateOutput(BaseModel):
+class MemoryRebuildVectorsOutput(BaseModel):
     dry_run: bool = True
-    pairs_found: int = 0
-    merged: int = 0
-    pairs: list[dict[str, object]] = Field(default_factory=list)
+    sessions_with_summary: int = 0
+    vec0_sessions_before: int = 0
+    would_remove_orphan_sessions: Optional[int] = None
+    orphan_sessions_removed: int = 0
+    vec0_sessions_cleared: int = 0
+    sessions_embedded: int = 0
+    sessions_failed: int = 0
+    vec0_sessions_after: Optional[int] = None
+    session_orphans_after: Optional[int] = None
+    sessions_missing_after: Optional[int] = None
+    threads_embedded: int = 0
+    capsules_embedded: int = 0
+    echoes_embedded: int = 0
     warnings: list[str] = Field(default_factory=list)
-
-
-class MemoryExportOutput(BaseModel):
-    facts: list[dict[str, Any]] = Field(default_factory=list)
-    sessions: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class MemoryStatusOutput(BaseModel):
     sessions: int = 0
-    facts: int = 0
+    threads: int = 0
+    capsules: int = 0
+    echoes: int = 0
     pending_consolidation: int = 0
     last_consolidation: Optional[datetime] = None
 
@@ -227,6 +139,53 @@ class MemoryHealthOutput(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class ApiKeyState(BaseModel):
+    status: str  # "loaded" | "missing" | "waiting_pass" | "failed"
+    source: Optional[str] = None
+    detail: Optional[str] = None
+    last_attempt: Optional[datetime] = None
+    attempt_count: int = 0
+    retry_interval_seconds: int = 30
+    pass_timeout_seconds: int = 120
+
+
+class ActiveSessionState(BaseModel):
+    id: Optional[str] = None
+    client: Optional[str] = None
+    conversation_id: Optional[str] = None
+    expression: str = "normal"
+    mood_text: str = ""
+    bound: bool = False
+
+
+class DaemonStatusOutput(BaseModel):
+    version: str
+    started_at: datetime
+    uptime_seconds: float
+    overall: str  # "ok" | "degraded" | "down"
+    status_label: str
+    status_summary: str
+    system_message: str = ""
+    system_message_level: str = "info"  # "ok" | "warning" | "error" | "info"
+    mode: str  # "online" | "offline"
+    online: bool = True
+    db_exists: bool = True
+    healthy: bool
+    checks: dict[str, MemoryHealthCheck] = Field(default_factory=dict)
+    warnings: list[str] = Field(default_factory=list)
+    api_key: ApiKeyState
+    stats: MemoryStatusOutput
+    active_session: ActiveSessionState
+    open_sessions: list[ActiveSessionState] = Field(default_factory=list)
+    sessions: int = 0
+    threads: int = 0
+    capsules: int = 0
+    echoes: int = 0
+    expression: str = "normal"
+    mood_text: str = ""
+    last_consolidation: Optional[datetime] = None
+
+
 class MemoryContextOutput(BaseModel):
     session_summary: Optional[str] = None
     client: Optional[str] = None
@@ -240,17 +199,8 @@ class MemoryContextOutput(BaseModel):
 # ── Consolidator sub-models ────────────────────────────────────────
 
 
-class ConsolidationFactItem(BaseModel):
-    action: ConsolidationAction
-    key: str
-    value: str
-    category: FactCategory
-    confidence: float = 1.0
-    ttl: Optional[int] = None
-    related_fact_id: Optional[int] = None
-    reason: str
-
-
 class ConsolidationResponse(BaseModel):
-    facts: list[ConsolidationFactItem] = Field(default_factory=list)
-    session_summary: str
+    threads: list[dict] = Field(default_factory=list)
+    relationship_capsules: list[dict] = Field(default_factory=list)
+    echoes: list[dict] = Field(default_factory=list)
+    model_config = {"extra": "ignore"}  # ignore legacy fields if any LLM still emits them
