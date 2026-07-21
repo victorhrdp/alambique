@@ -181,7 +181,9 @@ class ConsolidationMixin:
             existing = self.db.get_thread_by_key(key)
             thread_id = None
             target_id = None
-            if action == 'create' or not existing:
+            # Existence wins over LLM action: "create" on an existing key used to
+            # hit UNIQUE(threads.key) and abort the whole apply mid-flight.
+            if not existing:
                 thread_id = self.db.create_thread(
                     key=key,
                     title=title,
@@ -193,7 +195,15 @@ class ConsolidationMixin:
                     open_questions=json.dumps(open_questions) if open_questions else None
                 )
                 target_id = thread_id
+                if action != 'create':
+                    logger.info(
+                        f"Consolidation {session.id}: action={action} for new key {key}, created thread"
+                    )
             else:
+                if action == 'create':
+                    logger.warning(
+                        f"Consolidation {session.id}: LLM said create for existing key {key}, updating instead"
+                    )
                 target_id = existing['id']
                 self.db.update_thread(
                     key,
@@ -215,7 +225,19 @@ class ConsolidationMixin:
                         old = self.db.get_thread_by_key(old_key)
                         if old:
                             old_id = old['id']
-                            # Reassign participations to the surviving thread
+                            # Drop participations on the old thread that would collide
+                            # with UNIQUE(thread_id, session_id) on the survivor.
+                            self.db.conn.execute(
+                                """
+                                DELETE FROM thread_participations
+                                WHERE thread_id = ?
+                                  AND session_id IN (
+                                    SELECT session_id FROM thread_participations WHERE thread_id = ?
+                                  )
+                                """,
+                                (old_id, target_id),
+                            )
+                            # Reassign remaining participations to the surviving thread
                             self.db.conn.execute(
                                 "UPDATE thread_participations SET thread_id = ? WHERE thread_id = ?",
                                 (target_id, old_id)

@@ -1032,9 +1032,20 @@ CREATE TABLE IF NOT EXISTS session_expansions (
         self.conn.commit()
 
     def add_thread_participation(self, thread_id: int, session_id: str, contribution: str):
+        """Record or refresh this session's contribution to a thread.
+
+        Idempotent: re-consolidation and duplicate thread keys in one LLM
+        response would otherwise hit UNIQUE(thread_id, session_id).
+        """
         self.conn.execute(
-            "INSERT INTO thread_participations (thread_id, session_id, contribution_summary) VALUES (?, ?, ?)",
-            (thread_id, session_id, contribution)
+            """
+            INSERT INTO thread_participations (thread_id, session_id, contribution_summary)
+            VALUES (?, ?, ?)
+            ON CONFLICT(thread_id, session_id) DO UPDATE SET
+                contribution_summary = excluded.contribution_summary,
+                created_at = datetime('now')
+            """,
+            (thread_id, session_id, contribution),
         )
         self.conn.commit()
 

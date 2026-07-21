@@ -1368,3 +1368,82 @@ class TestSessionLifecycle:
         assert t is not None
         assert t['current_state'] == 'This is a long enough merged current state now.'
         assert 'Merged desc' in (t.get('description') or '')
+
+    def test_consolidation_create_on_existing_key_updates(self, tools, mock_ollama):
+        """LLM action=create on an existing key must update, not UNIQUE-fail."""
+        from alambique.models import ConsolidationResponse
+
+        session = tools.db.create_session()
+        tools.db.close_session(session.id, SessionStatus.CLOSED)
+        bound = tools.db.get_session(session.id)
+
+        tools.db.create_thread(
+            key="already_there",
+            title="Old title",
+            current_state="Old state that is already long enough here.",
+            tone_guidance="Old tone",
+            search_text="old",
+            salience=0.4,
+        )
+
+        response = ConsolidationResponse(
+            threads=[{
+                "action": "create",
+                "key": "already_there",
+                "title": "New title",
+                "current_state": "Updated state after create-on-existing path, long enough.",
+                "tone_guidance": "New tone",
+                "search_text": "new search",
+                "salience": 0.8,
+                "reason": "should update not insert",
+            }],
+            relationship_capsules=[],
+            echoes=[],
+        )
+
+        tools._consolidation_db_phase(bound, response)
+
+        t = tools.db.get_thread_by_key("already_there")
+        assert t is not None
+        assert t["title"] == "New title"
+        assert "Updated state" in t["current_state"]
+        rows = tools.db.conn.execute(
+            "SELECT COUNT(*) AS c FROM threads WHERE key = ?", ("already_there",)
+        ).fetchone()
+        assert rows["c"] == 1
+
+    def test_consolidation_participation_idempotent(self, tools, mock_ollama):
+        """Re-applying the same thread for a session must not UNIQUE-fail participations."""
+        from alambique.models import ConsolidationResponse
+
+        session = tools.db.create_session()
+        tools.db.close_session(session.id, SessionStatus.CLOSED)
+        bound = tools.db.get_session(session.id)
+
+        item = {
+            "action": "create",
+            "key": "idem_thread",
+            "title": "Idem",
+            "current_state": "First contribution state, long enough for validation rules.",
+            "tone_guidance": "tone",
+            "search_text": "idem",
+            "salience": 0.7,
+            "reason": "first pass",
+        }
+        response = ConsolidationResponse(threads=[item], relationship_capsules=[], echoes=[])
+        tools._consolidation_db_phase(bound, response)
+
+        item2 = dict(item)
+        item2["action"] = "update"
+        item2["current_state"] = "Second contribution state, still long enough for validation."
+        item2["reason"] = "second pass"
+        response2 = ConsolidationResponse(threads=[item2], relationship_capsules=[], echoes=[])
+        tools._consolidation_db_phase(bound, response2)
+
+        t = tools.db.get_thread_by_key("idem_thread")
+        parts = tools.db.conn.execute(
+            "SELECT contribution_summary FROM thread_participations WHERE thread_id = ? AND session_id = ?",
+            (t["id"], session.id),
+        ).fetchall()
+        assert len(parts) == 1
+        assert "second pass" in (parts[0]["contribution_summary"] or "")
