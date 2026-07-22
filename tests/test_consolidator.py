@@ -19,6 +19,13 @@ from alambique.models import Message
 # ── Formatting ───────────────────────────────────────────────────
 
 
+class TestPromptAnchoringRules:
+    def test_prompt_mentions_anchor_default_omit(self):
+        assert "ANCLAJE AL TRANSCRIPT" in CONSOLIDATION_PROMPT
+        assert "obliga a actualizarlo" in CONSOLIDATION_PROMPT
+        assert "Update fantasma" in CONSOLIDATION_PROMPT
+
+
 class TestFormatConversation:
     def test_format_single_message(self):
         msgs = [Message(session_id="s", role="user", content="Hola")]

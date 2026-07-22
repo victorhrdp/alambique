@@ -38,8 +38,15 @@ _WARNING_LABELS: dict[str, str] = {
 
 
 def _is_consolidation_filter(code: str) -> bool:
-    return code == "consolidation_filtered" or code.startswith(
-        ("consolidation_filtered_prefix:", "consolidation_filtered_substring:")
+    return (
+        code == "consolidation_filtered"
+        or code.startswith(
+            (
+                "consolidation_filtered_prefix:",
+                "consolidation_filtered_substring:",
+                "consolidation_thread_unanchored:",
+            )
+        )
     )
 
 
@@ -57,6 +64,9 @@ def humanize_warning(code: str) -> str:
     """Map one internal warning code to a short Spanish phrase."""
     if code in _WARNING_LABELS:
         return _WARNING_LABELS[code]
+    if code.startswith("consolidation_thread_unanchored:"):
+        key = code.split(":", 1)[1]
+        return f"hilo «{key}» no anclado a la sesión (update omitido)"
     if _is_consolidation_filter(code):
         return f"{_consolidation_filter_detail(code)} descartada al consolidar"
     if code.startswith("classification_warning:"):

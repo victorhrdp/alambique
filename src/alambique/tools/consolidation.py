@@ -9,12 +9,14 @@ from alambique.consolidator import ConsolidatorClient
 from alambique.memory_config import (
     AGENT_NAME,
     INITIATIVE_MIN_PAYLOAD_LEN,
+    THREAD_ANCHOR_MIN_HITS,
 )
 from alambique.models import (
     Consolidation,
     ConsolidationAction,
     Message,
 )
+from alambique.thread_anchor import is_thread_anchored_to_session
 from alambique.tools.text import messages_for_consolidation
 from alambique.vector_store import upsert_embedding
 
@@ -160,10 +162,13 @@ class ConsolidationMixin:
             logger.error("Fallo la llamada al consolidador: %s (se reintentará)", e)
             return
 
-        await self._apply_consolidation(session, response)
+        session_text = "\n".join(
+            (m.content or "") for m in consolidation_msgs if getattr(m, "content", None)
+        )
+        await self._apply_consolidation(session, response, session_text=session_text)
 
     def _consolidation_db_phase(
-        self, session, response
+        self, session, response, session_text: str = ""
     ) -> list[tuple[str, int, str]]:
         """Apply mutations for new memory model under the DB lock; return pending embedding jobs."""
         embed_requests: list[tuple[str, int, str]] = []
@@ -219,6 +224,28 @@ class ConsolidationMixin:
                     logger.warning(f"Consolidation {session.id}: merge for {key} without merged_from list")
 
             existing = self.db.get_thread_by_key(key)
+            # Gate update/merge on existing threads: session must mention the topic.
+            # Creates (new keys) pass — the LLM is inventing from this transcript.
+            if existing is not None:
+                if not is_thread_anchored_to_session(
+                    session_text,
+                    key,
+                    title=existing.get("title") or title,
+                    search_text=existing.get("search_text") or search_text,
+                    current_state=existing.get("current_state") or "",
+                    min_hits=THREAD_ANCHOR_MIN_HITS,
+                ):
+                    logger.warning(
+                        "Consolidation %s: skip unanchored %s for thread %s",
+                        session.id,
+                        action,
+                        key,
+                    )
+                    code = f"consolidation_thread_unanchored:{key}"
+                    if hasattr(self, "_consolidation_warnings"):
+                        self._consolidation_warnings.append(code)
+                    continue
+
             thread_id = None
             target_id = None
             # Existence wins over LLM action: "create" on an existing key used to
@@ -423,10 +450,12 @@ class ConsolidationMixin:
 
         return embed_requests
 
-    async def _apply_consolidation(self, session, response) -> None:
+    async def _apply_consolidation(self, session, response, session_text: str = "") -> None:
         """Apply consolidation: DB mutations under lock, embeddings outside lock."""
         async with self._db_guard():
-            embed_requests = self._consolidation_db_phase(session, response)
+            embed_requests = self._consolidation_db_phase(
+                session, response, session_text=session_text
+            )
 
         if embed_requests:
             try:

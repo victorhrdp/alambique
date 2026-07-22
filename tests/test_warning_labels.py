@@ -26,6 +26,13 @@ class TestBenignConsolidationLevel:
     def test_consolidation_only_is_benign(self):
         codes = ["consolidation_filtered_prefix:architecture_"]
         assert is_benign_consolidation_only(codes) is True
+
+    def test_unanchored_thread_is_benign_filter(self):
+        codes = ["consolidation_thread_unanchored:english_lessons_flirting"]
+        assert is_benign_consolidation_only(codes) is True
+        msg = humanize_warning(codes[0])
+        assert "english_lessons_flirting" in msg
+        assert "anclado" in msg
         assert warning_message_level(codes) == "info"
 
     def test_mixed_is_not_benign(self):

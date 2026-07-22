@@ -59,6 +59,10 @@ RECALL_TOP_K: int = 10
 CONSOLIDATION_CANDIDATE_POOL: int = 30
 CONSOLIDATION_TOP_K: int = 15
 
+# Lexical anchor gate (update/merge): min distinct thread-identity tokens that
+# must also appear in the session transcript. Pure string overlap — no embed.
+THREAD_ANCHOR_MIN_HITS: int = 2
+
 # ── LLM calls (recall summary, personality composition) ───────────
 # Retries transient OpenCode/network failures before surfacing to callers.
 

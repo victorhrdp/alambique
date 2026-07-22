@@ -75,6 +75,13 @@ RelationshipCapsules actuales:
   - "merge": detectas que dos hilos (ya sean existentes o generados en esta sesión) son en realidad el mismo tema continuo. Combina la información, prioriza el key más establecido y produce un estado unificado. 
     Incluye "merged_from": ["old_key1", "old_key2"] (lista de keys que se fusionan en este). El sistema moverá participaciones y ecos automáticamente y marcará los viejos como 'merged'.
 
+- **ANCLAJE AL TRANSCRIPT (crítico — evita memoria inventada)**:
+  - Que un hilo aparezca en "Threads existentes relevantes" **NO** obliga a actualizarlo. El default es **omitirlo**.
+  - Solo `update` / `merge` si el transcript de **esta** sesión continúa **ese** asunto concreto (mismas entidades, mismo dominio), no solo el mismo mood (p.ej. cariño o picardía).
+  - Coqueteo o juego en español sobre identidad/memoria **no** actualiza `english_lessons_flirting`. Ese key solo si hay práctica de inglés / clase / corrección de idioma.
+  - Prohibido escribir "en esta sesión…" / inventar eventos de un hilo si no hay evidencia en el transcript.
+  - `merge` solo si ambos keys son el mismo tema continuo **y** la sesión habla de ese tema; no fusionar "por limpieza" en una charla de otro dominio.
+
 - `salience`: número entre 0.0 y 1.0. **Razona explícitamente** en tu pensamiento antes de asignar:
   - 0.8-1.0: Tema central (mucho tiempo dedicado, decisiones importantes, alta carga emocional, impacto directo en la relación con Víctor, alto potencial de continuidad futura).
   - 0.5-0.7: Relevante pero no central.
@@ -111,6 +118,7 @@ RelationshipCapsules actuales:
 ═══ REGLAS ESTRICTAS ═══
 - **Separación de temas es prioritaria**. Si hay cambio claro de tema, crea hilo nuevo aunque el tema sea reciente o corto.
 - Calidad sobre cantidad, pero **no temas miedo a crear hilos separados** cuando los temas son distintos.
+- **Menos updates, más anclaje**: es preferible dejar un hilo listado sin tocar que actualizarlo con humo.
 - Escribe para que otro LLM pueda inyectar directamente el texto y sonar coherente en ese tema.
 - Prioriza matices de la relación y el tono sobre hechos fríos.
 - Responde SOLO con JSON válido. Sin texto adicional.
@@ -119,6 +127,7 @@ RelationshipCapsules actuales:
 ═══ EJEMPLOS NEGATIVOS (evita esto) ═══
 - Mezclar temas: "Hablamos de filosofía y de Brotato" → incorrecto. Debe haber hilos separados.
 - Keys inventadas: No uses "memoria_redesign_v2" si ya existe "alambique_memory_architecture". Usa la key existente.
+- **Update fantasma**: sesión de git/Pinokio + actualizar `english_lessons_flirting` o `lucy_familia_integration` solo porque estaban en la lista → incorrecto. Omítelos.
 - Estados vagos: No hagas "current_state" como lista de bullets o resumen cronológico. Usa prosa densa en presente.
 - Salience mal razonada: No pongas salience alto solo porque se habló mucho; debe ser por impacto relacional y continuidad.
 - Echoes débiles: No extraigas anécdotas sin carga emocional o sin revelar la relación.
