@@ -102,11 +102,12 @@ Script mental / forense sobre `~/.local/share/alambique/alambique.db`.
 
 ### Pendiente de esta loncha
 
-- [ ] **Commit** de los cambios (si no se hizo).
-- [ ] Smoke real del gate (ver §6: el force falló antes de apply).
+- [x] **Commit** de los cambios (si no se hizo). → `81c858e`
+- [x] Smoke real del gate (léxico sobre transcript real; force LLM sigue §6).
+- [x] No marcar `consolidated=1` si el resultado LLM está vacío (bug observado).
 - [ ] Loncha B: retrieval (menos high-salience a saco).
 - [ ] Curar merge familiar desanclado (datos).
-- [ ] No marcar `consolidated=1` si el resultado LLM está vacío (bug observado).
+- [ ] Reintentar force / re-prompt solo JSON (tras fix empty).
 
 ---
 

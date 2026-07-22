@@ -35,6 +35,12 @@ class TestBenignConsolidationLevel:
         assert "anclado" in msg
         assert warning_message_level(codes) == "info"
 
+    def test_empty_result_is_not_benign(self):
+        codes = ["consolidation_empty_result"]
+        assert is_benign_consolidation_only(codes) is False
+        assert warning_message_level(codes) == "warning"
+        assert "vacía" in humanize_warning(codes[0]).lower() or "JSON" in humanize_warning(codes[0])
+
     def test_mixed_is_not_benign(self):
         codes = ["ollama_unavailable", "consolidation_filtered_prefix:task_"]
         assert is_benign_consolidation_only(codes) is False

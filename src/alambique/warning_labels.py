@@ -26,6 +26,7 @@ _WARNING_LABELS: dict[str, str] = {
     "orphan_session_embeddings": "Hay vectores de sesión huérfanos",
     "sessions_missing_embeddings": "Sesiones con resumen sin vector",
     "consolidation_filtered": "Se descartó un hecho ruidoso al consolidar",
+    "consolidation_empty_result": "Consolidación vacía o no-JSON (no marcada como hecha)",
     "persona_offline_fallback": "Personalidad en modo offline",
     "persona_llm_failed": "No pude recomponer la personalidad",
     "vector_search_failed": "Búsqueda vectorial falló",

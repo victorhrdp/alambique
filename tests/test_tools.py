@@ -1413,7 +1413,12 @@ class TestSessionLifecycle:
             }]
         )
 
-        tools._consolidation_db_phase(bound, response)
+        # Anchor gate: existing keys need lexical hits in session_text
+        tools._consolidation_db_phase(
+            bound,
+            response,
+            session_text="We merge existing_key with merged search topic.",
+        )
 
         t = tools.db.get_thread_by_key('existing_key')
         assert t is not None
@@ -1452,7 +1457,9 @@ class TestSessionLifecycle:
             echoes=[],
         )
 
-        tools._consolidation_db_phase(bound, response)
+        tools._consolidation_db_phase(
+            bound, response, session_text="already_there old title update path"
+        )
 
         t = tools.db.get_thread_by_key("already_there")
         assert t is not None
@@ -1482,14 +1489,17 @@ class TestSessionLifecycle:
             "reason": "first pass",
         }
         response = ConsolidationResponse(threads=[item], relationship_capsules=[], echoes=[])
-        tools._consolidation_db_phase(bound, response)
+        # First create: new key, no anchor required
+        tools._consolidation_db_phase(bound, response, session_text="idem thread first")
 
         item2 = dict(item)
         item2["action"] = "update"
         item2["current_state"] = "Second contribution state, still long enough for validation."
         item2["reason"] = "second pass"
         response2 = ConsolidationResponse(threads=[item2], relationship_capsules=[], echoes=[])
-        tools._consolidation_db_phase(bound, response2)
+        tools._consolidation_db_phase(
+            bound, response2, session_text="idem thread second pass contribution"
+        )
 
         t = tools.db.get_thread_by_key("idem_thread")
         parts = tools.db.conn.execute(
@@ -1554,6 +1564,65 @@ class TestSessionLifecycle:
         )
         tools._consolidation_db_phase(bound, response)
         assert tools.db.get_pending_initiative() is None
+
+    def test_empty_llm_result_does_not_mark_consolidated(self, tools, mock_ollama):
+        """Markdown/non-JSON parse → empty ConsolidationResponse must leave consolidated=0."""
+        from alambique.models import ConsolidationResponse
+        from alambique.tools.consolidation import consolidation_has_payload
+
+        session = tools.db.create_session()
+        tools.db.close_session(session.id, SessionStatus.CLOSED)
+        bound = tools.db.get_session(session.id)
+        assert bound.consolidated is False
+
+        empty = ConsolidationResponse()
+        assert consolidation_has_payload(empty) is False
+        applied = asyncio.run(tools._apply_consolidation(bound, empty))
+        assert applied is False
+        refreshed = tools.db.get_session(session.id)
+        assert refreshed.consolidated is False
+
+    def test_apply_with_threads_marks_consolidated(self, tools, mock_ollama):
+        from alambique.models import ConsolidationResponse
+        from alambique.tools.consolidation import consolidation_has_payload
+
+        session = tools.db.create_session()
+        tools.db.close_session(session.id, SessionStatus.CLOSED)
+        bound = tools.db.get_session(session.id)
+
+        response = ConsolidationResponse(
+            threads=[{
+                "action": "create",
+                "key": "mark_done_thread",
+                "title": "Mark Done",
+                "current_state": "Estado suficientemente largo para pasar la validación del apply.",
+                "tone_guidance": "tono",
+                "search_text": "mark done thread",
+                "salience": 0.7,
+            }],
+            relationship_capsules=[],
+            echoes=[],
+        )
+        assert consolidation_has_payload(response) is True
+        applied = asyncio.run(tools._apply_consolidation(bound, response, session_text="mark done"))
+        assert applied is True
+        assert tools.db.get_session(session.id).consolidated is True
+
+    def test_initiative_only_payload_counts(self, tools, mock_ollama):
+        from alambique.models import ConsolidationResponse
+        from alambique.tools.consolidation import consolidation_has_payload
+
+        only_init = ConsolidationResponse(
+            lucy_initiative={
+                "prompt_payload": "Preguntarle a Víctor si quiere revisar el gate de anclaje.",
+                "reason": "continuity",
+            }
+        )
+        assert consolidation_has_payload(only_init) is True
+        short_only = ConsolidationResponse(
+            lucy_initiative={"prompt_payload": "corto"}
+        )
+        assert consolidation_has_payload(short_only) is False
 
 
 class TestInitiativeActivation:

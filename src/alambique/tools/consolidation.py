@@ -15,6 +15,7 @@ from alambique.models import (
     Consolidation,
     ConsolidationAction,
     Message,
+    SessionStatus,
 )
 from alambique.thread_anchor import is_thread_anchored_to_session
 from alambique.tools.text import messages_for_consolidation
@@ -60,6 +61,27 @@ def rewrite_open_questions_utf8(conn) -> int:
             )
             fixed += 1
     return fixed
+
+
+def consolidation_has_payload(response) -> bool:
+    """True if the consolidator returned something worth applying.
+
+    Empty responses happen when the LLM returns non-JSON (markdown synthesis),
+    parse failure, or a schema-valid but barren object. Those must not flip
+    sessions.consolidated — otherwise retries never re-queue.
+    """
+    if getattr(response, "threads", None):
+        return True
+    if getattr(response, "relationship_capsules", None):
+        return True
+    if getattr(response, "echoes", None):
+        return True
+    initiative = getattr(response, "lucy_initiative", None)
+    if isinstance(initiative, dict):
+        payload = initiative.get("prompt_payload")
+        if isinstance(payload, str) and len(payload.strip()) >= INITIATIVE_MIN_PAYLOAD_LEN:
+            return True
+    return False
 
 
 class ConsolidationMixin:
@@ -450,8 +472,23 @@ class ConsolidationMixin:
 
         return embed_requests
 
-    async def _apply_consolidation(self, session, response, session_text: str = "") -> None:
-        """Apply consolidation: DB mutations under lock, embeddings outside lock."""
+    async def _apply_consolidation(self, session, response, session_text: str = "") -> bool:
+        """Apply consolidation: DB mutations under lock, embeddings outside lock.
+
+        Returns True if the session was marked consolidated. Empty LLM payloads
+        (parse failure / non-JSON prose) return False and leave consolidated=0
+        so the session stays eligible for retry.
+        """
+        if not consolidation_has_payload(response):
+            logger.warning(
+                "Consolidation %s: empty LLM result (no threads/capsules/echoes/"
+                "initiative) — not marking consolidated",
+                session.id,
+            )
+            if hasattr(self, "_consolidation_warnings"):
+                self._consolidation_warnings.append("consolidation_empty_result")
+            return False
+
         async with self._db_guard():
             embed_requests = self._consolidation_db_phase(
                 session, response, session_text=session_text
@@ -487,6 +524,7 @@ class ConsolidationMixin:
                 pass
 
         logger.info("Consolidación completada para sesión %s", session.id)
+        return True
 
     async def consolidate_session(self, session_id: str, force: bool = False, light: bool = False) -> dict:
         """Fuerza (o re-ejecuta) la consolidación de una sesión específica.
@@ -499,7 +537,7 @@ class ConsolidationMixin:
         (evita una llamada cara a Ollama bge-m3). Útil si la consolidación está pegando
         mucho la CPU. El consolidator aún recibe threads recientes de alta salience.
 
-        Devuelve {"status": "ok", "session_id": ..., "consolidated": true} o error.
+        Devuelve status ok solo si la sesión queda consolidated=1 de verdad.
         """
         async with self._db_guard():
             session = self.db.get_session(session_id)
@@ -522,6 +560,7 @@ class ConsolidationMixin:
                 "status": "ok",
                 "message": "La sesión ya estaba consolidada (usa force=true para re-consolidar)",
                 "session_id": session_id,
+                "consolidated": True,
             }
 
         if force or not session.consolidated:
@@ -537,14 +576,31 @@ class ConsolidationMixin:
 
         try:
             await self._consolidate_session(session, light=light)
+        except Exception as e:
+            logger.error("Fallo consolidación forzada para %s: %s", session_id, e)
+            return {"status": "error", "message": str(e), "session_id": session_id}
+
+        async with self._db_guard():
+            session = self.db.get_session(session_id)
+        done = bool(session and session.consolidated)
+        if not done:
             return {
-                "status": "ok",
+                "status": "error",
+                "message": (
+                    "Consolidación sin payload útil (vacío o no-JSON): "
+                    "no se marcó consolidated; se puede reintentar"
+                ),
                 "session_id": session_id,
-                "consolidated": True,
+                "consolidated": False,
                 "was_open": original_status == "open",
                 "forced": force,
                 "light": light,
             }
-        except Exception as e:
-            logger.error("Fallo consolidación forzada para %s: %s", session_id, e)
-            return {"status": "error", "message": str(e), "session_id": session_id}
+        return {
+            "status": "ok",
+            "session_id": session_id,
+            "consolidated": True,
+            "was_open": original_status == "open",
+            "forced": force,
+            "light": light,
+        }
