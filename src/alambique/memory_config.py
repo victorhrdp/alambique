@@ -29,6 +29,13 @@ FLOOR_POSSESSIONS: float = 0.8
 
 STATE_DEFAULT_TTL: int = 86400
 
+# ── Lucy initiatives (MVP: single pending slot, future-oriented) ──
+# Injected at session_start; expire after N starts or max age in days.
+
+INITIATIVE_TTL_SESSIONS: int = 3
+INITIATIVE_TTL_DAYS: int = 14
+INITIATIVE_MIN_PAYLOAD_LEN: int = 20
+
 # ── Hybrid re-ranking (memory_recall) ─────────────────────────────
 # score = w_sim * similarity + w_conf * confidence + w_ref * reinforcement
 # reinforcement = min(1.0, access_count / RANK_ACCESS_CAP)

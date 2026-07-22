@@ -1,7 +1,9 @@
 """Tests for ToolHandler — all 8 MCP tools with mocked external deps."""
 
 import asyncio
+import json
 from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -497,13 +499,31 @@ class TestSessionEnd:
         s = tools.db.get_session(r.session_id)
         assert s.status == SessionStatus.TRUNCATED
 
-    def test_closed_session_pending_consolidation(self, tools):
-        r = asyncio.run(tools.session_start())
-        out = asyncio.run(tools.session_end(r.session_id))
-        pending = tools.db.get_pending_consolidations()
-        assert len(pending) == 1
-        assert out.queued is True
-        assert out.pending_consolidation == 1
+    def test_closed_session_triggers_auto_consolidation(self, tools):
+        """session_end queues work and fire-and-forget consolidate (no persistent loop).
+
+        Offline / empty transcript still marks consolidated=1 without leaving a
+        sticky pending row — that is intentional after the queue-loop redesign.
+        """
+
+        async def flow():
+            r = await tools.session_start()
+            out = await tools.session_end(r.session_id)
+            assert out.queued is True
+            # Same event loop as create_task: let auto-consolidate finish.
+            for _ in range(50):
+                s = tools.db.get_session(r.session_id)
+                if s and s.consolidated:
+                    break
+                await asyncio.sleep(0.01)
+            return r.session_id
+
+        sid = asyncio.run(flow())
+        session = tools.db.get_session(sid)
+        assert session is not None
+        assert session.status == SessionStatus.CLOSED
+        assert session.consolidated is True
+        assert tools.db.get_pending_consolidations() == []
 
     def test_session_end_with_transcript_sync(self, tools, monkeypatch):
         from pathlib import Path
@@ -921,14 +941,21 @@ class TestMemoryStatus:
         assert result.last_consolidation is None
 
     def test_status_with_data(self, tools):
-        r1 = asyncio.run(tools.session_start())
-        r2 = asyncio.run(tools.session_start())
-        asyncio.run(tools.session_end(r1.session_id))  # close to count as open => count session
+        async def flow():
+            r1 = await tools.session_start()
+            await tools.session_start()
+            await tools.session_end(r1.session_id)
+            for _ in range(50):
+                s = tools.db.get_session(r1.session_id)
+                if s and s.consolidated:
+                    break
+                await asyncio.sleep(0.01)
+            return await tools.memory_status()
 
-
-        result = asyncio.run(tools.memory_status())
+        result = asyncio.run(flow())
         assert result.sessions == 2
-        assert result.pending_consolidation == 1
+        # Auto-consolidation after session_end clears the pending queue.
+        assert result.pending_consolidation == 0
 
 
 # ── Vector helpers ───────────────────────────────────────────────
@@ -973,11 +1000,11 @@ class TestDbGuard:
 
 
 class TestBackgroundTasks:
-    def test_consolidation_loop_idle(self, tools):
+    def test_background_tasks_api_key_only(self, tools):
+        """No consolidation loop: only the API-key retry task runs in background."""
         asyncio.run(tools.start_background_tasks())
-        assert tools._consolidator_task is not None
-        # watchdog removed; api key retry task also started
         assert tools._api_key_retry_task is not None
+        assert not hasattr(tools, "_consolidator_task") or tools.__dict__.get("_consolidator_task") is None
         asyncio.run(tools.stop_background_tasks())
 
     def test_watchdog_detects_stale(self, tools, mock_ollama):
@@ -1248,7 +1275,7 @@ class TestSessionLifecycle:
                 "title": "Test Thread",
                 "current_state": "This is a longer current state for the thread to pass validation checks.",
                 "tone_guidance": "Tone here",
-                "open_questions": ["Q1?"],
+                "open_questions": ["Q1?", "¿Cómo se ve el UTF-8?"],
                 "search_text": "search text",
                 "salience": 0.9,
                 "description": "Desc here",
@@ -1277,6 +1304,9 @@ class TestSessionLifecycle:
         assert t is not None
         assert t["description"] == "Desc here"
         assert "Q1?" in str(t["open_questions"])
+        # Real UTF-8 in storage, not ensure_ascii \\uXXXX escapes
+        assert "¿Cómo se ve el UTF-8?" in t["open_questions"]
+        assert "\\u00" not in t["open_questions"]
 
         caps = tools.db.conn.execute("SELECT * FROM relationship_capsules WHERE scope = 'general'").fetchone()
         assert caps is not None
@@ -1289,6 +1319,27 @@ class TestSessionLifecycle:
         # Check audit
         audits = tools.db.conn.execute("SELECT * FROM consolidations WHERE session_id = ?", (session.id,)).fetchall()
         assert len(audits) >= 3
+
+    def test_rewrite_open_questions_utf8(self, tools, mock_ollama):
+        """Legacy rows stored with ensure_ascii=True get rewritten to real UTF-8."""
+        from alambique.tools.consolidation import rewrite_open_questions_utf8
+
+        escaped = json.dumps(["¿Cómo estás?", "¡Víctor!"])  # ensure_ascii=True default
+        assert "\\u00" in escaped
+        tools.db.create_thread(
+            key="unicode_legacy",
+            title="Legacy",
+            current_state="Estado largo suficiente para pasar validaciones mínimas del hilo.",
+            tone_guidance="tono",
+            open_questions=escaped,
+        )
+        n = rewrite_open_questions_utf8(tools.db.conn)
+        tools.db.conn.commit()
+        assert n >= 1
+        row = tools.db.get_thread_by_key("unicode_legacy")
+        assert "¿Cómo estás?" in row["open_questions"]
+        assert "¡Víctor!" in row["open_questions"]
+        assert "\\u00" not in row["open_questions"]
 
     def test_consolidation_skips_invalid_thread(self, tools, mock_ollama):
         from alambique.models import ConsolidationResponse
@@ -1447,3 +1498,85 @@ class TestSessionLifecycle:
         ).fetchall()
         assert len(parts) == 1
         assert "second pass" in (parts[0]["contribution_summary"] or "")
+
+    def test_consolidation_creates_lucy_initiative(self, tools, mock_ollama):
+        """Apply path persists lucy_initiative and supersedes previous pending."""
+        from alambique.models import ConsolidationResponse
+
+        session = tools.db.create_session()
+        tools.db.close_session(session.id, SessionStatus.CLOSED)
+        bound = tools.db.get_session(session.id)
+
+        tools.db.create_initiative(
+            "Iniciativa vieja que debe quedar superseded al crear una nueva."
+        )
+
+        response = ConsolidationResponse(
+            threads=[],
+            relationship_capsules=[],
+            echoes=[],
+            lucy_initiative={
+                "prompt_payload": (
+                    "Cuando el flujo lo permita, pregunta a Víctor si prefiere "
+                    "validar el MVP de iniciativas con 10 sesiones reales."
+                ),
+                "thread_key": "alambique_autonomy_design",
+                "reason": "Inquietud propia de Lucy, no un open_question",
+            },
+        )
+        tools._consolidation_db_phase(bound, response)
+
+        pending = tools.db.get_pending_initiative()
+        assert pending is not None
+        assert "MVP de iniciativas" in pending["prompt_payload"]
+        assert pending["thread_key"] == "alambique_autonomy_design"
+        assert pending["source_session_id"] == session.id
+        statuses = [
+            r["status"]
+            for r in tools.db.conn.execute(
+                "SELECT status FROM initiatives ORDER BY id"
+            ).fetchall()
+        ]
+        assert statuses == ["superseded", "pending"]
+
+    def test_consolidation_skips_short_initiative(self, tools, mock_ollama):
+        from alambique.models import ConsolidationResponse
+
+        session = tools.db.create_session()
+        tools.db.close_session(session.id, SessionStatus.CLOSED)
+        bound = tools.db.get_session(session.id)
+
+        response = ConsolidationResponse(
+            threads=[],
+            relationship_capsules=[],
+            echoes=[],
+            lucy_initiative={"prompt_payload": "corto", "reason": "too short"},
+        )
+        tools._consolidation_db_phase(bound, response)
+        assert tools.db.get_pending_initiative() is None
+
+
+class TestInitiativeActivation:
+    def test_session_start_injects_initiative(self, tools, mock_ollama, tmp_path, monkeypatch):
+        # Keep widget state out of the real ~/.local/share/alambique
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+        tools.db.create_initiative(
+            "Pregúntale a Víctor si quiere revisar el diff del MVP de iniciativas."
+        )
+        result = asyncio.run(tools.session_start())
+        assert result.status == "ok"
+        assert result.initial_context is not None
+        assert "INICIATIVA DE LUCY PARA HOY" in result.initial_context
+        assert "MVP de iniciativas" in result.initial_context
+        # One injection consumed a TTL slot
+        pending = tools.db.get_pending_initiative()
+        assert pending is not None
+        assert pending["sessions_seen"] == 1
+        mem = fake_home / ".local" / "share" / "alambique" / "active_memory.json"
+        assert mem.exists()
+        data = json.loads(mem.read_text(encoding="utf-8"))
+        assert data.get("pending_initiative")
+        assert "MVP" in data["pending_initiative"]["prompt_payload"]

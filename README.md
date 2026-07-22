@@ -47,7 +47,7 @@ Tras reiniciar el servicio o desplegar código nuevo, **recarga Grok** — el MC
 "mcp": {
   "alambique": {
     "type": "local",
-    "command": ["/home/victor/Work/Agents/alambique/.venv/bin/python", "-m", "alambique"],
+    "command": ["/home/victor/Work/Git/alambique/.venv/bin/python", "-m", "alambique"],
     "enabled": true
   }
 }

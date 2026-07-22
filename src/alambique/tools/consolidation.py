@@ -8,6 +8,7 @@ import logging
 from alambique.consolidator import ConsolidatorClient
 from alambique.memory_config import (
     AGENT_NAME,
+    INITIATIVE_MIN_PAYLOAD_LEN,
 )
 from alambique.models import (
     Consolidation,
@@ -18,6 +19,45 @@ from alambique.tools.text import messages_for_consolidation
 from alambique.vector_store import upsert_embedding
 
 logger = logging.getLogger("alambique.tools")
+
+
+def _dumps_open_questions(open_questions: list | None) -> str | None:
+    """Serialize open_questions as JSON with real UTF-8 (not \\uXXXX escapes).
+
+    Historical bug: json.dumps default ensure_ascii=True stored Spanish as
+    literal escapes in SQLite; the widget then showed '\\u00bfComo...' instead
+    of '¿Cómo...'. Always write ensure_ascii=False.
+    """
+    if not open_questions:
+        return None
+    return json.dumps(open_questions, ensure_ascii=False)
+
+
+def rewrite_open_questions_utf8(conn) -> int:
+    """Re-serialize threads.open_questions with ensure_ascii=False. Returns rows fixed."""
+    rows = conn.execute(
+        "SELECT id, open_questions FROM threads WHERE open_questions IS NOT NULL"
+    ).fetchall()
+    fixed = 0
+    for row in rows:
+        raw = row["open_questions"] if hasattr(row, "keys") else row[1]
+        tid = row["id"] if hasattr(row, "keys") else row[0]
+        if not raw or not isinstance(raw, str):
+            continue
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(parsed, list):
+            continue
+        new = json.dumps(parsed, ensure_ascii=False)
+        if new != raw:
+            conn.execute(
+                "UPDATE threads SET open_questions = ? WHERE id = ?",
+                (new, tid),
+            )
+            fixed += 1
+    return fixed
 
 
 class ConsolidationMixin:
@@ -192,7 +232,7 @@ class ConsolidationMixin:
                     search_text=search_text,
                     salience=salience,
                     description=description,
-                    open_questions=json.dumps(open_questions) if open_questions else None
+                    open_questions=_dumps_open_questions(open_questions)
                 )
                 target_id = thread_id
                 if action != 'create':
@@ -213,7 +253,7 @@ class ConsolidationMixin:
                     search_text=search_text,
                     salience=salience,
                     description=description,
-                    open_questions=json.dumps(open_questions) if open_questions else None
+                    open_questions=_dumps_open_questions(open_questions)
                 )
                 thread_id = target_id
 
@@ -345,6 +385,41 @@ class ConsolidationMixin:
                 reason=f"Echo added for thread {thread_key or 'general'}",
             )
             self.db.insert_consolidation(c)
+
+        # Lucy initiative MVP: single future-oriented slot (optional)
+        initiative = getattr(response, "lucy_initiative", None)
+        if isinstance(initiative, dict):
+            payload = initiative.get("prompt_payload")
+            if (
+                isinstance(payload, str)
+                and len(payload.strip()) >= INITIATIVE_MIN_PAYLOAD_LEN
+            ):
+                thread_key = initiative.get("thread_key")
+                if thread_key is not None and not isinstance(thread_key, str):
+                    thread_key = None
+                reason = initiative.get("reason") or "Lucy initiative from consolidation"
+                initiative_id = self.db.create_initiative(
+                    payload.strip(),
+                    thread_key=thread_key,
+                    source_session_id=session.id,
+                )
+                c = Consolidation(
+                    session_id=session.id,
+                    action=ConsolidationAction.CREATE,
+                    reason=f"Initiative #{initiative_id}: {reason}"[:500],
+                    new_value=payload.strip()[:500],
+                )
+                self.db.insert_consolidation(c)
+                logger.info(
+                    "Consolidation %s: created initiative #%s",
+                    session.id,
+                    initiative_id,
+                )
+            else:
+                logger.warning(
+                    "Consolidation %s: lucy_initiative missing/short prompt_payload, skipped",
+                    session.id,
+                )
 
         return embed_requests
 

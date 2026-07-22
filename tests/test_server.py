@@ -36,7 +36,7 @@ def _make_fake_server():
 
 class TestToolDefinitions:
     def test_tool_count(self):
-        assert len(TOOL_DEFINITIONS) == 12
+        assert len(TOOL_DEFINITIONS) == 13
 
     def test_all_tool_names(self):
         names = {t.name for t in TOOL_DEFINITIONS}
@@ -47,6 +47,7 @@ class TestToolDefinitions:
             "memory_rebuild_vectors",
             "memory_context", "session_list",
             "memory_expand_thread", "close_session",
+            "consolidate_session",
         }
         assert names == expected
 
@@ -93,7 +94,7 @@ class TestRegisterHandlers:
         result = loop.run_until_complete(handlers["list_tools"](None))
         loop.close()
 
-        assert len(result) == 12
+        assert len(result) == 13
 
 
 class TestToolDispatch:

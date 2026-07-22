@@ -98,6 +98,16 @@ RelationshipCapsules actuales:
 - Ligarlo al hilo si corresponde (puede ser null si es general).
 - Incluye "emotional_valence": float entre -1.0 (negativo/emocionalmente cargado negativo) y 1.0 (positivo), o null si no aplica. Ayuda a priorizar ecos con carga emocional real.
 
+5. INICIATIVA DE LUCY (opcional, máximo una)
+- Genera **como máximo 1** objeto `lucy_initiative` orientado al **futuro** y al **criterio/interés de Lucy**, no un eco del pasado.
+- Pregunta guía: *"¿Qué pregunta, dilema o propuesta le interesaría a Lucy plantearle a Víctor más adelante, que aún NO esté resuelta?"*
+- **NO** reformules `open_questions` de un hilo ni digas "el otro día hablamos de X" / "retomar el tema Y". Eso ya está en los hilos.
+- **SÍ** formula una inquietud propia: una duda técnica que a Lucy le pique, una propuesta de experimento, un matiz relacional o de diseño que ella querría empujar.
+- `prompt_payload`: 1-3 frases en español, en segunda persona hacia Lucy (instrucción de lo que puede plantear), concretas y naturales.
+- `thread_key`: key del hilo relacionado si aplica, o null.
+- `reason`: por qué es iniciativa propia y no un simple pendiente del hilo.
+- Si la sesión no da material genuino para una iniciativa propia, devuelve `"lucy_initiative": null`. Mejor null que relleno vacío.
+
 ═══ REGLAS ESTRICTAS ═══
 - **Separación de temas es prioritaria**. Si hay cambio claro de tema, crea hilo nuevo aunque el tema sea reciente o corto.
 - Calidad sobre cantidad, pero **no temas miedo a crear hilos separados** cuando los temas son distintos.
@@ -154,7 +164,12 @@ FORMATO DE SALIDA (JSON estricto):
       "emotional_valence": 0.8,
       "reason": "Momento de risa que define el tono"
     }}
-  ]
+  ],
+  "lucy_initiative": {{
+    "prompt_payload": "Cuando el flujo lo permita, pregunta a Víctor si ...",
+    "thread_key": "alambique_memory_architecture" | null,
+    "reason": "Inquietud propia de Lucy, no un open_question del hilo"
+  }} | null
 }}
 """
 
@@ -242,6 +257,10 @@ class ConsolidatorClient:
         if not isinstance(echoes, list):
             logger.warning("Consolidator 'echoes' is not a list, treating as empty")
             parsed['echoes'] = []
+        initiative = parsed.get('lucy_initiative', None)
+        if initiative is not None and not isinstance(initiative, dict):
+            logger.warning("Consolidator 'lucy_initiative' is not a dict or null, ignoring")
+            parsed['lucy_initiative'] = None
 
         try:
             resp = ConsolidationResponse(**parsed)

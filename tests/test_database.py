@@ -49,7 +49,7 @@ class TestDatabaseLifecycle:
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()
         }
-        for t in ("sessions", "messages", "consolidations"):
+        for t in ("sessions", "messages", "consolidations", "initiatives"):
             assert t in tables, f"Table {t} not found"
 
     def test_wal_mode(self, db):
@@ -258,6 +258,71 @@ class TestMemoryExport:
         s2 = db.create_session()
         sessions = db.get_all_sessions()
         assert len(sessions) == 2
+
+
+class TestInitiatives:
+    def test_create_and_get_pending(self, db):
+        session = db.create_session()
+        iid = db.create_initiative(
+            "Pregúntale a Víctor si quiere bajar el MVP de iniciativas a un diff concreto.",
+            thread_key="alambique_autonomy_design",
+            source_session_id=session.id,
+            ttl_sessions=3,
+        )
+        pending = db.get_pending_initiative()
+        assert pending is not None
+        assert pending["id"] == iid
+        assert pending["status"] == "pending"
+        assert "MVP" in pending["prompt_payload"]
+        assert pending["thread_key"] == "alambique_autonomy_design"
+
+    def test_single_slot_supersedes_previous(self, db):
+        db.create_initiative("Primera iniciativa pendiente lo bastante larga para pasar.")
+        second = db.create_initiative(
+            "Segunda iniciativa que debe dejar solo un slot pendiente activo."
+        )
+        pending = db.get_pending_initiative()
+        assert pending is not None
+        assert pending["id"] == second
+        rows = db.conn.execute(
+            "SELECT status FROM initiatives ORDER BY id"
+        ).fetchall()
+        assert [r["status"] for r in rows] == ["superseded", "pending"]
+
+    def test_injection_ttl_sessions(self, db):
+        iid = db.create_initiative(
+            "Iniciativa con TTL de dos arranques de sesión para probar caducidad.",
+            ttl_sessions=2,
+        )
+        db.record_initiative_injection(iid)
+        p = db.get_pending_initiative()
+        assert p is not None
+        assert p["sessions_seen"] == 1
+        assert p["status"] == "pending"
+
+        db.record_initiative_injection(iid)
+        # After 2 injections, expired; no longer pending
+        assert db.get_pending_initiative() is None
+        row = db.conn.execute(
+            "SELECT status, sessions_seen FROM initiatives WHERE id = ?", (iid,)
+        ).fetchone()
+        assert row["status"] == "expired"
+        assert row["sessions_seen"] == 2
+
+    def test_expire_by_age(self, db):
+        iid = db.create_initiative(
+            "Iniciativa antigua que debería caducar por edad en días."
+        )
+        db.conn.execute(
+            "UPDATE initiatives SET created_at = datetime('now', '-20 days') WHERE id = ?",
+            (iid,),
+        )
+        db.conn.commit()
+        assert db.get_pending_initiative() is None
+        row = db.conn.execute(
+            "SELECT status FROM initiatives WHERE id = ?", (iid,)
+        ).fetchone()
+        assert row["status"] == "expired"
 
 
 def test_legacy_facts_migration(tmp_path):

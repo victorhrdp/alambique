@@ -55,13 +55,34 @@ class ActivationEngine:
         for t in threads:
             echoes.extend(self.db.get_top_echoes_for_thread(t["id"], limit=2))
 
+        # Optional single Lucy initiative (future-oriented; may bump TTL counter)
+        initiative = None
+        initiative_public = None
+        try:
+            initiative = self.db.get_pending_initiative()
+            if initiative:
+                updated = self.db.record_initiative_injection(initiative["id"])
+                initiative_public = {
+                    "id": initiative["id"],
+                    "prompt_payload": initiative.get("prompt_payload") or "",
+                    "thread_key": initiative.get("thread_key"),
+                    "sessions_seen": (updated or initiative).get("sessions_seen"),
+                    "ttl_sessions": initiative.get("ttl_sessions"),
+                    "status": (updated or initiative).get("status", "pending"),
+                }
+        except Exception:
+            initiative = None
+            initiative_public = None
+
         # Assemble
-        context = self._assemble_context(capsule, threads, echoes)
+        context = self._assemble_context(capsule, threads, echoes, initiative)
         context = self._truncate_to_tokens(context, 1300)
 
         return {
             "initial_context": context,
             "active_thread_keys": [t["key"] for t in threads],
+            "initiative_id": initiative_public["id"] if initiative_public else None,
+            "initiative": initiative_public,
         }
 
     async def expand(self, thread_key: str, already_sent_echo_ids: List[int] = None) -> Dict[str, Any]:
@@ -129,7 +150,13 @@ class ActivationEngine:
         scored.sort(key=lambda x: x[0], reverse=True)
         return [t for _, t in scored]
 
-    def _assemble_context(self, capsule: str, threads: list, echoes: list) -> str:
+    def _assemble_context(
+        self,
+        capsule: str,
+        threads: list,
+        echoes: list,
+        initiative: dict | None = None,
+    ) -> str:
         parts = []
         if capsule:
             parts.append("=== RELACIÓN Y CARÁCTER ===\n" + capsule)
@@ -159,6 +186,13 @@ class ActivationEngine:
                 if val is not None:
                     line += f" [valence: {val}]"
                 parts.append(line)
+        if initiative and initiative.get("prompt_payload"):
+            payload = initiative["prompt_payload"].strip()
+            parts.append(
+                "[INICIATIVA DE LUCY PARA HOY]\n"
+                f"Tienes pendiente plantearle a Víctor (úsalo solo cuando el flujo "
+                f"lo permita de forma natural):\n{payload}"
+            )
         return "\n\n".join(parts)
 
     def _truncate_to_tokens(self, text: str, max_tokens: int) -> str:

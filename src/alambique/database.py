@@ -25,7 +25,7 @@ from alambique.models import (
 
 logger = logging.getLogger("alambique.db")
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 # facts index removed (legacy)
 
@@ -123,6 +123,22 @@ CREATE TABLE IF NOT EXISTS session_expansions (
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(session_id, thread_key)
 );
+
+-- Single-slot future initiatives for Lucy (MVP autonomy)
+CREATE TABLE IF NOT EXISTS initiatives (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_key          TEXT,
+    prompt_payload      TEXT NOT NULL,
+    source_session_id   TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+    status              TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending', 'consumed', 'expired', 'superseded')),
+    ttl_sessions        INTEGER NOT NULL DEFAULT 3,
+    sessions_seen       INTEGER NOT NULL DEFAULT 0,
+    created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at          TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_initiatives_status ON initiatives(status);
 """
 
 MessageFTS_SQL = """
@@ -204,6 +220,9 @@ class Database:
             current = 7
         if current < 8:
             self._migrate_v7_to_v8()
+            current = 8
+        if current < 9:
+            self._migrate_v8_to_v9()
 
     def _backup_database(self) -> Path:
         """Copy the database (and WAL sidecars) before a schema migration."""
@@ -341,6 +360,21 @@ CREATE TABLE IF NOT EXISTS session_expansions (
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(session_id, thread_key)
 );
+
+CREATE TABLE IF NOT EXISTS initiatives (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_key          TEXT,
+    prompt_payload      TEXT NOT NULL,
+    source_session_id   TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+    status              TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending', 'consumed', 'expired', 'superseded')),
+    ttl_sessions        INTEGER NOT NULL DEFAULT 3,
+    sessions_seen       INTEGER NOT NULL DEFAULT 0,
+    created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at          TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_initiatives_status ON initiatives(status);
 """
         try:
             self.conn.executescript(redesign_sql)
@@ -447,6 +481,31 @@ CREATE TABLE IF NOT EXISTS session_expansions (
         self.conn.execute("PRAGMA user_version = 8")
         self.conn.commit()
         logger.info("Migración v7→v8 completada.")
+
+    def _migrate_v8_to_v9(self) -> None:
+        """Add initiatives table for Lucy's future-oriented autonomy MVP."""
+        self._backup_database()
+        logger.info("Migrando de v8 a v9 (tabla initiatives)...")
+        self.conn.executescript(
+            """
+CREATE TABLE IF NOT EXISTS initiatives (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_key          TEXT,
+    prompt_payload      TEXT NOT NULL,
+    source_session_id   TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+    status              TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending', 'consumed', 'expired', 'superseded')),
+    ttl_sessions        INTEGER NOT NULL DEFAULT 3,
+    sessions_seen       INTEGER NOT NULL DEFAULT 0,
+    created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at          TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_initiatives_status ON initiatives(status);
+"""
+        )
+        self.conn.execute("PRAGMA user_version = 9")
+        self.conn.commit()
+        logger.info("Migración v8→v9 completada.")
 
     def get_latest_open_session_row(self) -> sqlite3.Row | None:
         if self._column_exists("sessions", "expression"):
@@ -1145,6 +1204,127 @@ CREATE TABLE IF NOT EXISTS session_expansions (
             (*keys, limit),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # ── Initiatives (Lucy autonomy MVP) ────────────────────────────
+
+    def expire_stale_initiatives(
+        self,
+        ttl_days: int | None = None,
+    ) -> int:
+        """Mark pending initiatives expired by age or sessions_seen. Returns rows touched."""
+        from alambique.memory_config import INITIATIVE_TTL_DAYS
+
+        max_days = INITIATIVE_TTL_DAYS if ttl_days is None else ttl_days
+        # Prefer each row's own ttl_sessions so per-initiative overrides work.
+        cur = self.conn.execute(
+            """
+            UPDATE initiatives
+            SET status = 'expired', updated_at = datetime('now')
+            WHERE status = 'pending'
+              AND (
+                sessions_seen >= ttl_sessions
+                OR (julianday('now') - julianday(created_at)) >= ?
+              )
+            """,
+            (max_days,),
+        )
+        self.conn.commit()
+        return cur.rowcount
+
+    def get_pending_initiative(self) -> dict | None:
+        """Return the current pending initiative (at most one by design), after TTL expiry.
+
+        Read-only for widgets/status: does not bump sessions_seen.
+        """
+        self.expire_stale_initiatives()
+        row = self.conn.execute(
+            """
+            SELECT * FROM initiatives
+            WHERE status = 'pending'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        return dict(row) if row else None
+
+    def create_initiative(
+        self,
+        prompt_payload: str,
+        *,
+        thread_key: str | None = None,
+        source_session_id: str | None = None,
+        ttl_sessions: int | None = None,
+    ) -> int:
+        """Create a new pending initiative; supersede any previous pending (single slot)."""
+        from alambique.memory_config import INITIATIVE_TTL_SESSIONS
+
+        ttl = INITIATIVE_TTL_SESSIONS if ttl_sessions is None else ttl_sessions
+        self.conn.execute(
+            """
+            UPDATE initiatives
+            SET status = 'superseded', updated_at = datetime('now')
+            WHERE status = 'pending'
+            """
+        )
+        cur = self.conn.execute(
+            """
+            INSERT INTO initiatives (
+                thread_key, prompt_payload, source_session_id, status, ttl_sessions
+            ) VALUES (?, ?, ?, 'pending', ?)
+            """,
+            (thread_key, prompt_payload, source_session_id, ttl),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def record_initiative_injection(self, initiative_id: int) -> dict | None:
+        """Bump sessions_seen after injecting into session_start; expire if TTL reached."""
+        row = self.conn.execute(
+            "SELECT * FROM initiatives WHERE id = ? AND status = 'pending'",
+            (initiative_id,),
+        ).fetchone()
+        if not row:
+            return None
+        initiative = dict(row)
+        new_seen = int(initiative.get("sessions_seen") or 0) + 1
+        ttl = int(initiative.get("ttl_sessions") or 3)
+        if new_seen >= ttl:
+            self.conn.execute(
+                """
+                UPDATE initiatives
+                SET sessions_seen = ?, status = 'expired', updated_at = datetime('now')
+                WHERE id = ?
+                """,
+                (new_seen, initiative_id),
+            )
+        else:
+            self.conn.execute(
+                """
+                UPDATE initiatives
+                SET sessions_seen = ?, updated_at = datetime('now')
+                WHERE id = ?
+                """,
+                (new_seen, initiative_id),
+            )
+        self.conn.commit()
+        initiative["sessions_seen"] = new_seen
+        if new_seen >= ttl:
+            initiative["status"] = "expired"
+        return initiative
+
+    def mark_initiative_status(self, initiative_id: int, status: str) -> None:
+        """Set initiative status (consumed / expired / superseded)."""
+        if status not in ("pending", "consumed", "expired", "superseded"):
+            raise ValueError(f"Invalid initiative status: {status}")
+        self.conn.execute(
+            """
+            UPDATE initiatives
+            SET status = ?, updated_at = datetime('now')
+            WHERE id = ?
+            """,
+            (status, initiative_id),
+        )
+        self.conn.commit()
 
 
 # _LEGACY_CATEGORIES and _row_to_fact removed (legacy facts)

@@ -203,4 +203,7 @@ class ConsolidationResponse(BaseModel):
     threads: list[dict] = Field(default_factory=list)
     relationship_capsules: list[dict] = Field(default_factory=list)
     echoes: list[dict] = Field(default_factory=list)
+    # Optional single future-oriented initiative for Lucy (MVP).
+    # null / omitted when nothing genuine to propose.
+    lucy_initiative: Optional[dict] = None
     model_config = {"extra": "ignore"}  # ignore legacy fields if any LLM still emits them

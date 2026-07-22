@@ -223,19 +223,31 @@ class TestConsolidatorRetries:
         from alambique.consolidator import ConsolidatorClient
         from alambique.models import Message
 
-        request = httpx.Request("POST", "https://opencode.ai/zen/go/v1/messages")
+        request = httpx.Request("POST", "https://opencode.ai/zen/go/v1/chat/completions")
         error_500 = httpx.HTTPStatusError(
             "error",
             request=request,
             response=httpx.Response(500, request=request),
         )
+        # OpenAI-compatible chat.completion payload (current OpenCode Go path)
+        payload_text = (
+            '```json\n{"threads":[{"key":"test_thread","title":"Test",'
+            '"current_state":"ok state long enough for the model",'
+            '"tone_guidance":"neutral","search_text":"test","action":"update",'
+            '"salience":0.7,"reason":"retry test"}],'
+            '"relationship_capsules":[{"scope":"general","content":"updated capsule"}],'
+            '"echoes":[{"thread_key":"test_thread","content":"echo1","salience":0.6}],'
+            '"lucy_initiative":null}\n```'
+        )
         ok = MagicMock()
         ok.raise_for_status = MagicMock()
         ok.json.return_value = {
-            "content": [
+            "choices": [
                 {
-                    "type": "text",
-                    "text": '```json\n{"facts":[],"threads":[{"key":"test_thread","title":"Test","current_state":"ok state","action":"update"}],"relationship_capsules":[{"scope":"general","content":"updated"}],"echoes":[{"thread_key":"test_thread","content":"echo1"}]}\n```',
+                    "message": {
+                        "role": "assistant",
+                        "content": payload_text,
+                    }
                 }
             ]
         }
@@ -249,10 +261,9 @@ class TestConsolidatorRetries:
         ]
 
         with patch("alambique.llm_http.asyncio.sleep", new_callable=AsyncMock):
-            result = await client.consolidate("Lucy", messages, [])
+            result = await client.consolidate("Lucy", messages)
 
         assert len(result.threads) == 1
-        assert result.threads[0]["current_state"] == "ok state"
-        # New model fields covered in test
-        assert "relationship_capsules" in str(result) or True  # indirect
+        assert result.threads[0]["current_state"] == "ok state long enough for the model"
+        assert result.lucy_initiative is None
         assert client._client.post.call_count == 2

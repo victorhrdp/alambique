@@ -231,9 +231,11 @@ class SessionMixin:
             from pathlib import Path
             mem_path = Path.home() / ".local" / "share" / "alambique" / "active_memory.json"
             mem_path.parent.mkdir(parents=True, exist_ok=True)
+            initiative = act.get("initiative")
             mem_path.write_text(json.dumps({
                 "active_thread_keys": act.get("active_thread_keys", []),
                 "initial_context_snippet": (act.get("initial_context") or "")[:800],
+                "pending_initiative": initiative,
                 "updated_at": __import__("datetime").datetime.now().isoformat()
             }, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception as e:
