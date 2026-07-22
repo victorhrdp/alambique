@@ -252,6 +252,36 @@ def test_legacy_facts_migration(tmp_path):
         assert not d._table_exists("facts")
         d.close()
 
+class TestThreadRetrieval:
+    def test_recent_active_orders_by_last_active_not_salience(self, db):
+        db.create_thread(
+            key="old_famous",
+            title="Old",
+            current_state="Estado largo suficiente para un hilo famoso pero viejo.",
+            tone_guidance="t",
+            salience=0.99,
+        )
+        db.create_thread(
+            key="new_quiet",
+            title="New",
+            current_state="Estado largo suficiente para un hilo nuevo y menos saliente.",
+            tone_guidance="t",
+            salience=0.4,
+        )
+        # Bump only new_quiet as more recent
+        db.conn.execute(
+            "UPDATE threads SET last_active_at = datetime('now', '-2 days') WHERE key = 'old_famous'"
+        )
+        db.conn.execute(
+            "UPDATE threads SET last_active_at = datetime('now') WHERE key = 'new_quiet'"
+        )
+        db.conn.commit()
+        recent = db.get_recent_active_threads(limit=2)
+        assert recent[0]["key"] == "new_quiet"
+        high = db.get_high_salience_recent_threads(limit=2)
+        assert high[0]["key"] == "old_famous"
+
+
 class TestMemoryExport:
     def test_get_all_sessions(self, db):
         s1 = db.create_session()

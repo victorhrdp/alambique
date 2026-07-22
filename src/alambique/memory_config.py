@@ -57,7 +57,16 @@ RECALL_TOP_K: int = 10
 # Facts passed to the consolidator LLM (vector search over session text).
 
 CONSOLIDATION_CANDIDATE_POOL: int = 30
-CONSOLIDATION_TOP_K: int = 15
+CONSOLIDATION_TOP_K: int = 15  # legacy name; prefer LIST_CAP below for threads
+
+# Loncha B — which *existing* threads appear in the consolidator prompt.
+# Goal: fewer "hall of fame" high-salience rows that tempt ghost updates.
+# Similar (embed of this session) first; small recency floor; hard list cap.
+CONSOLIDATION_SIMILAR_LIMIT: int = 8
+CONSOLIDATION_RECENCY_LIMIT: int = 4
+CONSOLIDATION_LIST_CAP: int = 10
+# vec0 distance: drop weak neighbors (sim ≈ 1/(1+d); d=1.5 → sim≈0.4)
+CONSOLIDATION_MAX_VECTOR_DISTANCE: float = 1.5
 
 # Lexical anchor gate (update/merge): min distinct thread-identity tokens that
 # must also appear in the session transcript. Pure string overlap — no embed.

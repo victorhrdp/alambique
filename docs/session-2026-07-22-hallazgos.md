@@ -105,9 +105,9 @@ Script mental / forense sobre `~/.local/share/alambique/alambique.db`.
 - [x] **Commit** de los cambios (si no se hizo). → `81c858e`
 - [x] Smoke real del gate (léxico sobre transcript real; force LLM sigue §6).
 - [x] No marcar `consolidated=1` si el resultado LLM está vacío (bug observado).
-- [ ] Loncha B: retrieval (menos high-salience a saco).
+- [x] Loncha B: retrieval (menos high-salience a saco) — `consolidation_retrieval.py`.
 - [ ] Curar merge familiar desanclado (datos).
-- [ ] Reintentar force / re-prompt solo JSON (tras fix empty).
+- [x] Reintentar force / empty-fix (force OK 22 jul noche).
 
 ---
 

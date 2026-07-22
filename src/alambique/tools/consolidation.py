@@ -6,8 +6,13 @@ import json
 import logging
 
 from alambique.consolidator import ConsolidatorClient
+from alambique.consolidation_retrieval import (
+    format_threads_for_prompt,
+    select_threads_for_consolidation_prompt,
+)
 from alambique.memory_config import (
     AGENT_NAME,
+    CONSOLIDATION_RECENCY_LIMIT,
     INITIATIVE_MIN_PAYLOAD_LEN,
     THREAD_ANCHOR_MIN_HITS,
 )
@@ -118,50 +123,47 @@ class ConsolidationMixin:
                 self.db.conn.commit()
             return
 
-        # Prepare dense context for new thematic consolidation (threads + capsules)
+        # Prepare dense context for new thematic consolidation (threads + capsules).
+        # Loncha B: similar-to-this-session first; small recency floor; hard cap.
+        # (Apply still has the lexical anchor gate as defense in depth.)
         threads_text = "(ninguno relevante)"
         capsules_text = "(ninguna)"
         try:
+            similar_hits: list = []
+            if not light:
+                try:
+                    conv_text = " ".join(
+                        m.content for m in consolidation_msgs[:5] if getattr(m, "content", None)
+                    )[:1500]
+                    if conv_text:
+                        emb = await self.ollama.embed(conv_text)
+                        async with self._db_guard():
+                            similar_hits = self.db.vector_search_threads(emb, limit=10)
+                except Exception as e:
+                    logger.warning(
+                        "Similar threads search skipped due to error "
+                        "(light mode recommended if frequent): %s",
+                        e,
+                    )
+                    similar_hits = []
+
             async with self._db_guard():
-                # Get recent/salient threads + (optionally) semantically similar ones.
-                # light mode skips the Ollama embed + vec search to reduce CPU.
-                recent_threads = self.db.get_high_salience_recent_threads(limit=15)
-                similar_threads = []
-                if not light:
-                    try:
-                        # Embed a short version of the conversation to find similar existing threads
-                        conv_text = " ".join([m.content for m in consolidation_msgs[:5]])[:1500]
-                        if conv_text:
-                            emb = await self.ollama.embed(conv_text)
-                            hits = self.db.vector_search_threads(emb, limit=10)
-                            for h in hits:
-                                t = h.get("thread", h) if isinstance(h, dict) else h
-                                if t:
-                                    similar_threads.append(t)
-                    except Exception as e:
-                        logger.warning("Similar threads search skipped due to error (light mode recommended if frequent): %s", e)
-
-                all_threads = recent_threads + similar_threads
-                # dedup by key
-                seen = set()
-                unique_threads = []
-                for t in all_threads:
-                    k = t.get("key") if isinstance(t, dict) else None
-                    if k and k not in seen:
-                        seen.add(k)
-                        unique_threads.append(t)
-
-                if unique_threads:
-                    lines = []
-                    for t in unique_threads[:25]:  # cap to not overwhelm prompt
-                        state_snippet = (t.get('current_state','') or '')[:180].replace('\n', ' ')
-                        desc = t.get('description','') or ''
-                        desc_part = f" | description: {desc[:100]}" if desc else ""
-                        oq = t.get('open_questions') or ''
-                        oq_part = f" | open_questions: {oq[:80]}" if oq else ""
-                        sal = t.get('salience', 0.5)
-                        lines.append(f"- key={t.get('key')}: {t.get('title','')} {desc_part}{oq_part} | salience: {sal} | current_state: {state_snippet}")
-                    threads_text = "\n".join(lines)
+                recent_threads = self.db.get_recent_active_threads(
+                    limit=CONSOLIDATION_RECENCY_LIMIT
+                )
+                selected = select_threads_for_consolidation_prompt(
+                    similar_hits=similar_hits,
+                    recent_threads=recent_threads,
+                )
+                threads_text = format_threads_for_prompt(selected)
+                if selected:
+                    logger.info(
+                        "Consolidation %s: prompt threads=%d keys=%s light=%s",
+                        session.id,
+                        len(selected),
+                        [t.get("key") for t in selected],
+                        light,
+                    )
                 cap = self.db.get_relevant_relationship_capsule()
                 if cap:
                     capsules_text = cap[:600]

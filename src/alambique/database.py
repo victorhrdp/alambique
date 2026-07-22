@@ -1052,12 +1052,32 @@ CREATE INDEX IF NOT EXISTS idx_initiatives_status ON initiatives(status);
         return cap_id
 
     def get_high_salience_recent_threads(self, limit: int = 5, max_days: int = 30) -> list[dict]:
-        """Return active threads with high salience and recent activity."""
+        """Return active threads with high salience and recent activity.
+
+        Used by activation (session_start). Prefer get_recent_active_threads for
+        consolidation context (loncha B: less salience-first dumping).
+        """
         sql = """
             SELECT * FROM threads 
             WHERE status = 'active' 
               AND (julianday('now') - julianday(last_active_at)) < ?
             ORDER BY salience DESC, last_active_at DESC 
+            LIMIT ?
+        """
+        rows = self.conn.execute(sql, (max_days, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_recent_active_threads(self, limit: int = 4, max_days: int = 30) -> list[dict]:
+        """Active threads ordered by recency (not salience).
+
+        Small floor for consolidation prompts so the last few topics stay
+        visible without re-listing every high-salience hall-of-fame thread.
+        """
+        sql = """
+            SELECT * FROM threads
+            WHERE status = 'active'
+              AND (julianday('now') - julianday(last_active_at)) < ?
+            ORDER BY last_active_at DESC, salience DESC
             LIMIT ?
         """
         rows = self.conn.execute(sql, (max_days, limit)).fetchall()
