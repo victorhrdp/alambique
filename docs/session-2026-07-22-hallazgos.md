@@ -106,7 +106,7 @@ Script mental / forense sobre `~/.local/share/alambique/alambique.db`.
 - [x] Smoke real del gate (léxico sobre transcript real; force LLM sigue §6).
 - [x] No marcar `consolidated=1` si el resultado LLM está vacío (bug observado).
 - [x] Loncha B: retrieval (menos high-salience a saco) — `consolidation_retrieval.py`.
-- [ ] Curar merge familiar desanclado (datos).
+- [x] Curar merge familiar desanclado (datos) — 22 jul noche, ver §11.
 - [x] Reintentar force / empty-fix (force OK 22 jul noche).
 
 ---
@@ -188,6 +188,30 @@ tests/test_consolidator.py
 tests/test_warning_labels.py
 docs/session-2026-07-22-hallazgos.md    (este doc)
 ```
+
+---
+
+## 11. Curación `lucy_familia_integration` (2026-07-22 noche)
+
+### Diagnóstico
+
+| Pieza | Hallazgo |
+|-------|----------|
+| `sess_ebc0c881af86` | Pinokio/Fooocus (13 msgs). **0** menciones familia/Noemí/hijos. |
+| Participación #46 | Contribución inventada: “merge de duplicados” en esa sesión. |
+| Contenido del hilo | **Limpio** (Noemí, Aarón, Isaac, reforma). Sin bleed de Pinokio. |
+| Keys | `lucy_familia_integracion` (id 10, `merged`) y `lucy_familia_integration` (id 13, active). Sí eran duplicados reales (16 jul); el merge en 19 jul fue **en sesión equivocada**, no un invento de tema. |
+| Ecos | 2, anclados a sesiones familiares reales. OK. |
+
+### Acciones en DB viva (`~/.local/share/alambique/alambique.db`)
+
+1. Backup: `/tmp/alambique_pre_familia_curation_20260722_211845.db`
+2. `DELETE` participación id 46 (`sess_ebc0c881af86`).
+3. `last_active_at` → `2026-07-16 22:25:07` (última charla familiar real).
+4. `search_text` enriquecido con tokens del sibling merged.
+5. Fila de auditoría en `consolidations` (reason `CURACIÓN MANUAL 2026-07-22…`).
+
+Participaciones que quedan: `sess_4a000e908269`, `sess_267a242e22c9`.
 
 ---
 
